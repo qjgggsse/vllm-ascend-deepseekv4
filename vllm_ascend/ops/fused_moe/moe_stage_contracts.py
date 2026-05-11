@@ -143,6 +143,21 @@ class MoEMlpComputeInput:
     swiglu_limit: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class MoEMlpStageOutputs:
+    """Best-effort explicit stage outputs for routed MoE MLP orchestration.
+
+    Note: some quantized fused kernels do not expose true intermediate tensors.
+    In those cases, stage outputs may conservatively alias the input/final output,
+    while still giving the orchestration layer stable stage names and hooks.
+    """
+
+    stage_input: torch.Tensor
+    gmm1_output: torch.Tensor
+    swiglu_output: torch.Tensor
+    gmm2_output: torch.Tensor
+
+
 __all__ = [
     "MoEPrepareOutput",
     "MoEWeights",
@@ -153,5 +168,6 @@ __all__ = [
     "MoEAllToAllCombineMetadata",
     "MoETokenDispatchOutput",
     "MoEMlpComputeInput",
+    "MoEMlpStageOutputs",
     "TMoECombineMetadata",
 ]

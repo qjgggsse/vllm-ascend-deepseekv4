@@ -101,7 +101,25 @@ env_variables: dict[str, Callable[[], Any]] = {
     # `dispatch_gmm_combine_decode` can be used only for **decode node** moe layer
     # with W8A8. And MTP layer must be W8A8.
     "VLLM_ASCEND_ENABLE_FUSED_MC2": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")),
-    # Whether to anbale balance scheduling
+    # Enable Prefill routed MoE micro-batch pipeline orchestration.
+    # 0: disabled, keep the current routed path.
+    # 1: enabled, allow routed micro-batch split and staged execution.
+    "VLLM_ASCEND_ENABLE_MOE_PREFILL_MICROBATCH_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_MOE_PREFILL_MICROBATCH_OVERLAP", "0"))
+    ),
+    # Debug output for routed MoE micro-batch strategy and stage sequencing.
+    # 0: disabled.
+    # 1: log micro-batch plan/stage information for validation environments.
+    "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_MOE_PREFILL_MICROBATCH_DEBUG", "0"))
+    ),
+    # Minimum routed tokens required to enable Prefill micro-batch mode.
+    "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS", "2")
+    ),
+    # Whether to enable balance scheduling in the v1 scheduler.
+    # Platform validation: only PD-mixed mode (`kv_role='kv_both'` or no kv_transfer_config).
+    # Not supported in PD-disaggregated mode (`kv_producer` / `kv_consumer` only).
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
     # use fused op transpose_kv_cache_by_block, default is True
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(

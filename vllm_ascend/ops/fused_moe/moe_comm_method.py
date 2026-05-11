@@ -19,11 +19,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import torch
+from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
-from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
+from vllm_ascend.ops.fused_moe.moe_mlp import build_mlp_stage_outputs, unified_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEFusedExpertsInput,
     MoEMlpComputeInput,
@@ -31,6 +32,7 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     build_mlp_compute_input,
     build_token_dispatch_input,
 )
+from vllm_ascend.ops.fused_moe.moe_stage_params import MoERoutingParams
 from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalize,
     PrepareAndFinalizeWithAll2All,
@@ -45,10 +47,202 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
 )
 from vllm_ascend.quantization.quant_type import QuantType
 
-_MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
+MICRO_BATCH_STAGE_NAMES = (
+    "routing_topk",
+    "cast_preprocess",
+    "dispatch",
+    "gmm1",
+    "swiglu",
+    "gmm2_downproj",
+    "combine",
+    "finalize_merge",
+)
 
 
-def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | None:
+@dataclass
+class MicroBatchEvents:
+    routing_topk_done_evt: torch.npu.Event | None = None
+    cast_preprocess_done_evt: torch.npu.Event | None = None
+    dispatch_done_evt: torch.npu.Event | None = None
+    gmm1_done_evt: torch.npu.Event | None = None
+    swiglu_done_evt: torch.npu.Event | None = None
+    gmm2_downproj_done_evt: torch.npu.Event | None = None
+    combine_done_evt: torch.npu.Event | None = None
+
+
+@dataclass
+class MicroBatchPlan:
+    enabled: bool
+    batch_size: int
+    min_tokens: int
+    total_tokens: int
+    split_sizes: tuple[int, int]
+    mode: str
+
+
+@dataclass
+class MicroBatchChunk:
+    batch_idx: int
+    hidden_states: torch.Tensor
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+    mc2_mask: torch.Tensor | None
+    pertoken_scale: torch.Tensor | None
+
+
+@dataclass
+class FusedExpertsResult:
+    routed_out: torch.Tensor
+    before_dispatch_evt: torch.npu.Event | None = None
+    before_combine_evt: torch.npu.Event | None = None
+    group_list_type: int = 1
+    expert_tokens: torch.Tensor | None = None
+
+
+_MoECommMethods: dict[MoECommType | None, "MoECommMethod"] = {}
+
+
+def _record_stage_event(stream: torch.npu.Stream | None = None) -> torch.npu.Event:
+    current_stream = stream if stream is not None else torch.npu.current_stream()
+    return current_stream.record_event()
+
+
+def _maybe_log_micro_batch_plan(plan: MicroBatchPlan) -> None:
+    if not envs_ascend.VLLM_ASCEND_MOE_PREFILL_MICROBATCH_DEBUG:
+        return
+    logger.info(
+        "[MB-PLAN] enabled=%s total_tokens=%s split=%s min_tokens=%s mode=%s stages=%s",
+        int(plan.enabled),
+        plan.total_tokens,
+        plan.split_sizes,
+        plan.min_tokens,
+        plan.mode,
+        "->".join(MICRO_BATCH_STAGE_NAMES),
+    )
+
+
+def _maybe_log_micro_batch_stage(
+    batch_idx: int,
+    stage: str,
+    *,
+    waits: list[str] | None = None,
+    records: list[str] | None = None,
+    stream_name: str = "current",
+) -> None:
+    if not envs_ascend.VLLM_ASCEND_MOE_PREFILL_MICROBATCH_DEBUG:
+        return
+    logger.info(
+        "[MB-STAGE] batch%s:%s stream=%s wait=%s record=%s",
+        batch_idx,
+        stage,
+        stream_name,
+        waits or [],
+        records or [],
+    )
+
+
+def build_micro_batch_plan(num_tokens: int) -> MicroBatchPlan:
+    enabled = envs_ascend.VLLM_ASCEND_ENABLE_MOE_PREFILL_MICROBATCH_OVERLAP
+    min_tokens = envs_ascend.VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS
+    if not enabled or num_tokens < min_tokens:
+        return MicroBatchPlan(
+            enabled=False,
+            batch_size=1,
+            min_tokens=min_tokens,
+            total_tokens=num_tokens,
+            split_sizes=(num_tokens, 0),
+            mode="legacy",
+        )
+
+    batch0 = (num_tokens + 1) // 2
+    batch1 = num_tokens - batch0
+    plan = MicroBatchPlan(
+        enabled=True,
+        batch_size=2,
+        min_tokens=min_tokens,
+        total_tokens=num_tokens,
+        split_sizes=(batch0, batch1),
+        mode="conservative",
+    )
+    _maybe_log_micro_batch_plan(plan)
+    return plan
+
+
+def _split_optional_tensor(value: torch.Tensor | None, plan: MicroBatchPlan) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if value is None:
+        return None, None
+    if not plan.enabled or value.dim() == 0:
+        return value, None
+    batch0_tokens, batch1_tokens = plan.split_sizes
+    first = value[:batch0_tokens]
+    second = value[batch0_tokens : batch0_tokens + batch1_tokens] if batch1_tokens > 0 else None
+    return first, second
+
+
+def build_micro_batch_fused_inputs(
+    fused_experts_input: MoEFusedExpertsInput,
+    plan: MicroBatchPlan,
+) -> list[MoEFusedExpertsInput]:
+    if not plan.enabled:
+        return [fused_experts_input]
+
+    batch0_tokens, batch1_tokens = plan.split_sizes
+    topk_weights0, topk_weights1 = _split_optional_tensor(fused_experts_input.topk_weights, plan)
+    topk_ids0, topk_ids1 = _split_optional_tensor(fused_experts_input.topk_ids, plan)
+    mc2_mask0, mc2_mask1 = _split_optional_tensor(fused_experts_input.routing.mc2_mask, plan)
+    pertoken_scale0, pertoken_scale1 = _split_optional_tensor(fused_experts_input.routing.pertoken_scale, plan)
+
+    outputs = [
+        MoEFusedExpertsInput(
+            hidden_states=fused_experts_input.hidden_states[:batch0_tokens],
+            topk_weights=topk_weights0,
+            topk_ids=topk_ids0,
+            weights=fused_experts_input.weights,
+            routing=MoERoutingParams(
+                expert_map=fused_experts_input.routing.expert_map,
+                global_redundant_expert_num=fused_experts_input.routing.global_redundant_expert_num,
+                mc2_mask=mc2_mask0,
+                apply_router_weight_on_input=fused_experts_input.routing.apply_router_weight_on_input,
+                log2phy=fused_experts_input.routing.log2phy,
+                pertoken_scale=pertoken_scale0,
+            ),
+            quant=fused_experts_input.quant,
+            activation=fused_experts_input.activation,
+            need_trans=fused_experts_input.need_trans,
+            dynamic_eplb=fused_experts_input.dynamic_eplb,
+        )
+    ]
+    if batch1_tokens > 0:
+        outputs.append(
+            MoEFusedExpertsInput(
+                hidden_states=fused_experts_input.hidden_states[batch0_tokens : batch0_tokens + batch1_tokens],
+                topk_weights=topk_weights1,
+                topk_ids=topk_ids1,
+                weights=fused_experts_input.weights,
+                routing=MoERoutingParams(
+                    expert_map=fused_experts_input.routing.expert_map,
+                    global_redundant_expert_num=fused_experts_input.routing.global_redundant_expert_num,
+                    mc2_mask=mc2_mask1,
+                    apply_router_weight_on_input=fused_experts_input.routing.apply_router_weight_on_input,
+                    log2phy=fused_experts_input.routing.log2phy,
+                    pertoken_scale=pertoken_scale1,
+                ),
+                quant=fused_experts_input.quant,
+                activation=fused_experts_input.activation,
+                need_trans=fused_experts_input.need_trans,
+                dynamic_eplb=fused_experts_input.dynamic_eplb,
+            )
+        )
+    return outputs
+
+
+def merge_micro_batch_outputs(outputs: list[torch.Tensor]) -> torch.Tensor:
+    if len(outputs) == 1:
+        return outputs[0]
+    return torch.cat(outputs, dim=0)
+
+
+def get_moe_comm_method(moe_comm_type: MoECommType | None) -> "MoECommMethod" | None:
     return _MoECommMethods.get(moe_comm_type)
 
 
@@ -66,26 +260,11 @@ def set_gmmswigluquant_method():
     return ascend_config.ascend_fusion_config.fusion_ops_gmmswigluquant
 
 
-@dataclass
-class FusedExpertsResult:
-    routed_out: torch.Tensor
-    # This field is for shared experts and should be set by the MoE
-    # communication method that supports shared experts in parallel with routed
-    # experts.
-    before_dispatch_evt: torch.npu.Event | None = None
-    before_gmm2_evt: torch.npu.Event | None = None
-    before_combine_evt: torch.npu.Event | None = None
-    # For dynamic_eplb
-    group_list_type: int = 1
-    expert_tokens: torch.Tensor | None = None
-
-
 class MoECommMethod(ABC):
     """Base class for MoE communication methods."""
 
     def __init__(self, moe_config: FusedMoEConfig):
         self.moe_config = moe_config
-
         self.token_dispatcher = self._get_token_dispatcher()
         self.prepare_finalize = self._get_prepare_finalize()
         self.use_fusion_ops = set_gmmswigluquant_method()
@@ -119,41 +298,110 @@ class MoECommMethod(ABC):
         self,
         fused_experts_input: MoEFusedExpertsInput,
     ):
-        # Check constraints
         assert fused_experts_input.hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16, torch.int8]
+        plan = build_micro_batch_plan(fused_experts_input.hidden_states.shape[0])
+        fused_inputs = build_micro_batch_fused_inputs(fused_experts_input, plan)
 
-        moe_comm_method = _EXTRA_CTX.moe_comm_method
-        assert moe_comm_method is not None, "Missing communication context"
+        if len(fused_inputs) == 1:
+            return self._run_stage_pipeline(fused_inputs[0], batch_idx=0)
 
-        before_dispatch_evt = torch.npu.current_stream().record_event()
+        results: list[FusedExpertsResult] = []
+        batch_events = [MicroBatchEvents(), MicroBatchEvents()]
+        for batch_idx, chunk_input in enumerate(fused_inputs):
+            if batch_idx == 1:
+                if batch_events[0].dispatch_done_evt is not None:
+                    torch.npu.current_stream().wait_event(batch_events[0].dispatch_done_evt)
+            result = self._run_stage_pipeline(
+                chunk_input,
+                batch_idx=batch_idx,
+                previous_events=batch_events[batch_idx - 1] if batch_idx > 0 else None,
+                current_events=batch_events[batch_idx],
+            )
+            results.append(result)
+
+        return FusedExpertsResult(
+            routed_out=merge_micro_batch_outputs([result.routed_out for result in results]),
+            before_dispatch_evt=results[0].before_dispatch_evt,
+            before_combine_evt=results[-1].before_combine_evt,
+            group_list_type=results[-1].group_list_type,
+            expert_tokens=results[-1].expert_tokens,
+        )
+
+    def _run_stage_pipeline(
+        self,
+        fused_experts_input: MoEFusedExpertsInput,
+        *,
+        batch_idx: int,
+        previous_events: MicroBatchEvents | None = None,
+        current_events: MicroBatchEvents | None = None,
+    ) -> FusedExpertsResult:
+        if current_events is None:
+            current_events = MicroBatchEvents()
+
+        waits = ["batch0.dispatch_done_evt"] if previous_events is not None else []
+        _maybe_log_micro_batch_stage(batch_idx, "routing_topk", waits=waits, records=["routing_topk_done_evt"])
+        current_events.routing_topk_done_evt = _record_stage_event()
+
+        _maybe_log_micro_batch_stage(
+            batch_idx,
+            "cast_preprocess",
+            waits=["routing_topk_done_evt"],
+            records=["cast_preprocess_done_evt"],
+        )
+        current_events.cast_preprocess_done_evt = _record_stage_event()
+
         routed_topk_ids = fused_experts_input.topk_ids
         if fused_experts_input.routing.log2phy is not None:
             routed_topk_ids = fused_experts_input.routing.log2phy[routed_topk_ids]
 
+        before_dispatch_evt = _record_stage_event()
         token_dispatch_input = build_token_dispatch_input(
             fused_experts_input=fused_experts_input,
             topk_ids=routed_topk_ids,
         )
+        _maybe_log_micro_batch_stage(
+            batch_idx,
+            "dispatch",
+            waits=["cast_preprocess_done_evt"],
+            records=["dispatch_done_evt"],
+        )
         token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
+        current_events.dispatch_done_evt = _record_stage_event()
 
         mlp_compute_input = build_mlp_compute_input(
             fused_experts_input=fused_experts_input,
             token_dispatch_output=token_dispatch_output,
             use_fusion_ops=self.use_fusion_ops,
         )
+        mlp_stage_outputs = build_mlp_stage_outputs(mlp_compute_input=mlp_compute_input)
+        _maybe_log_micro_batch_stage(batch_idx, "gmm1", waits=["dispatch_done_evt"], records=["gmm1_done_evt"])
+        current_events.gmm1_done_evt = _record_stage_event()
+        _maybe_log_micro_batch_stage(batch_idx, "swiglu", waits=["gmm1_done_evt"], records=["swiglu_done_evt"])
+        current_events.swiglu_done_evt = _record_stage_event()
+        _maybe_log_micro_batch_stage(
+            batch_idx,
+            "gmm2_downproj",
+            waits=["swiglu_done_evt"],
+            records=["gmm2_downproj_done_evt"],
+        )
+        current_events.gmm2_downproj_done_evt = _record_stage_event()
 
-        mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
-
-        before_combine_evt = torch.npu.current_stream().record_event()
+        before_combine_evt = _record_stage_event()
+        _maybe_log_micro_batch_stage(
+            batch_idx,
+            "combine",
+            waits=["gmm2_downproj_done_evt"],
+            records=["combine_done_evt"],
+        )
         routed_out = self.token_dispatcher.token_combine(
-            hidden_states=mlp_output,
+            hidden_states=mlp_stage_outputs.gmm2_output,
             combine_metadata=token_dispatch_output.combine_metadata,
         )
+        current_events.combine_done_evt = _record_stage_event()
 
         return FusedExpertsResult(
             routed_out=routed_out,
             before_dispatch_evt=before_dispatch_evt,
-            before_gmm2_evt=before_gmm2_evt,
             before_combine_evt=before_combine_evt,
             group_list_type=token_dispatch_output.group_list_type,
             expert_tokens=token_dispatch_output.group_list,
@@ -172,24 +420,6 @@ class MoECommMethod(ABC):
 
 
 class AllGatherCommImpl(MoECommMethod):
-    """This implementation is the same as NativeAllGatherCommImpl,
-    but uses NPU-specific ops for better performance.
-
-    This implementation should be compatible with all scenarios, and
-    thus it is the default implementation for MoE communication methods.
-    It uses `torch_npu.npu_moe_init_routing_v2` for pre-processing
-    and `torch_npu.npu_moe_token_unpermute` for post-processing
-    to handle the token-to-expert mapping and communication efficiently.
-
-    NOTE(Yizhou): TBH, it is really weird that we were supposed to use
-    `torch_npu.npu_moe_init_routing_v2` and `torch_npu.npu_moe_finalize_routing`
-    or `torch_npu.npu_moe_token_permute` and `torch_npu.npu_moe_token_unpermute`
-    for pre-processing and post-processing, respectively.
-    But `npu_moe_finalize_routing` will lead to accuracy issues so we have to
-    use `torch_npu.npu_moe_token_unpermute` instead.
-    This is a workaround and should be removed after the issue is fixed.
-    """
-
     def _get_token_dispatcher(self):
         return TokenDispatcherWithAllGather(
             top_k=self.moe_config.experts_per_token,
@@ -202,17 +432,6 @@ class AllGatherCommImpl(MoECommMethod):
 
 
 class MC2CommImpl(MoECommMethod):
-    """This implementation is for the scenarios listed below:
-    1. `enable_expert_parallel=True`.
-    2. `npu_moe_distribute_dispatch` and `npu_moe_distribute_combine` are available.
-    3. `enable_expert_parallel=False` is not supported.
-
-    This implementation uses the MC2 communication method, which is optimized for
-    Communication and Computation parallelism on Ascend devices.
-    """
-    def pad_and_split_input_ids(self, input_ids):
-        return self.prepare_finalize.pad_and_split_input_ids(input_ids)
-    
     def _get_token_dispatcher(self):
         return TokenDispatcherWithMC2()
 
@@ -221,17 +440,6 @@ class MC2CommImpl(MoECommMethod):
 
 
 class AlltoAllCommImpl(MoECommMethod):
-    """This implementation is for the scenarios listed below:
-    1. `enable_expert_parallel=True`.
-    2. `npu_grouped_matmul` is available.
-
-    This implementation uses all-to-all communication to exchange tokens
-    between data parallel ranks before and after the MLP computation. It should
-    have better performance than AllGatherCommImpl when DP size > 1.
-    """
-    def pad_and_split_input_ids(self, input_ids):
-        return self.prepare_finalize.pad_and_split_input_ids(input_ids)
-
     def _get_token_dispatcher(self):
         return TokenDispatcherWithAll2AllV(
             top_k=self.moe_config.experts_per_token,
@@ -244,17 +452,6 @@ class AlltoAllCommImpl(MoECommMethod):
 
 
 class FusedMC2CommImpl(MoECommMethod):
-    """This implementation is for the scenarios listed below:
-    1. `enable_expert_parallel=True`.
-    2. `npu_moe_distribute_dispatch` and `npu_moe_distribute_combine` are available.
-    3. `enable_expert_parallel=False` is not supported.
-
-    This implementation uses the MC2 communication method, which is optimized for
-    Communication and Computation parallelism on Ascend devices.
-    """
-    def pad_and_split_input_ids(self, input_ids):
-        return self.prepare_finalize.pad_and_split_input_ids(input_ids)
-    
     def __init__(self, moe_config):
         super().__init__(moe_config)
         if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
@@ -275,16 +472,10 @@ class FusedMC2CommImpl(MoECommMethod):
         assert not (fused_experts_input.weights.w1_scale is None or fused_experts_input.weights.w2_scale is None), (
             "w1_scale and w2_scale cannot be None for FusedMC2CommImpl."
         )
-
-        assert not (fused_experts_input.weights.w1_scale_bias is None or fused_experts_input.weights.w2_scale_bias is None), (
-            "w1_scale_bias and w2_scale_bias cannot be None for FusedMC2CommImpl."
-        )
-
         assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2), (
             "token_dispatcher must be an instance of TokenDispatcherWithMC2."
         )
 
-        # Apply log2phy if needed
         topk_ids = fused_experts_input.topk_ids
         if fused_experts_input.routing.log2phy is not None:
             topk_ids = fused_experts_input.routing.log2phy[topk_ids]
@@ -299,12 +490,9 @@ class FusedMC2CommImpl(MoECommMethod):
                 expert_idx=topk_ids,
                 scale1=fused_experts_input.weights.w1_scale,
                 scale2=fused_experts_input.weights.w2_scale,
-                bias1=fused_experts_input.weights.w1_scale_bias,
-                bias2=fused_experts_input.weights.w2_scale_bias,
                 probs=fused_experts_input.topk_weights.to(torch.float32),
                 group=self.token_dispatcher.moe_all_to_all_group_name,
                 max_output_size=65536,
-                swiglu_limit=fused_experts_input.swiglu_limit,
                 out=out,
                 expert_token_nums=self.expert_token_nums,
             )

@@ -107,6 +107,13 @@ def _record_stage_event(stream: torch.npu.Stream | None = None) -> torch.npu.Eve
     return current_stream.record_event()
 
 
+def _wait_for_stage_event(event: torch.npu.Event | None, event_name: str, *, batch_idx: int, stage: str) -> None:
+    if event is None:
+        return
+    _maybe_log_micro_batch_stage(batch_idx, stage, waits=[event_name], records=[])
+    torch.npu.current_stream().wait_event(event)
+
+
 def _maybe_log_micro_batch_plan(plan: MicroBatchPlan) -> None:
     if not envs_ascend.VLLM_ASCEND_MOE_PREFILL_MICROBATCH_DEBUG:
         return
@@ -308,9 +315,6 @@ class MoECommMethod(ABC):
         results: list[FusedExpertsResult] = []
         batch_events = [MicroBatchEvents(), MicroBatchEvents()]
         for batch_idx, chunk_input in enumerate(fused_inputs):
-            if batch_idx == 1:
-                if batch_events[0].dispatch_done_evt is not None:
-                    torch.npu.current_stream().wait_event(batch_events[0].dispatch_done_evt)
             result = self._run_stage_pipeline(
                 chunk_input,
                 batch_idx=batch_idx,
@@ -338,14 +342,16 @@ class MoECommMethod(ABC):
         if current_events is None:
             current_events = MicroBatchEvents()
 
-        waits = ["batch0.dispatch_done_evt"] if previous_events is not None else []
-        _maybe_log_micro_batch_stage(batch_idx, "routing_topk", waits=waits, records=["routing_topk_done_evt"])
+        if previous_events is not None:
+            _wait_for_stage_event(previous_events.dispatch_done_evt, "batch0.dispatch_done_evt", batch_idx=batch_idx, stage="routing_topk")
+        _maybe_log_micro_batch_stage(batch_idx, "routing_topk", waits=[], records=["routing_topk_done_evt"])
         current_events.routing_topk_done_evt = _record_stage_event()
 
+        _wait_for_stage_event(current_events.routing_topk_done_evt, "routing_topk_done_evt", batch_idx=batch_idx, stage="cast_preprocess")
         _maybe_log_micro_batch_stage(
             batch_idx,
             "cast_preprocess",
-            waits=["routing_topk_done_evt"],
+            waits=[],
             records=["cast_preprocess_done_evt"],
         )
         current_events.cast_preprocess_done_evt = _record_stage_event()
@@ -354,6 +360,7 @@ class MoECommMethod(ABC):
         if fused_experts_input.routing.log2phy is not None:
             routed_topk_ids = fused_experts_input.routing.log2phy[routed_topk_ids]
 
+        _wait_for_stage_event(current_events.cast_preprocess_done_evt, "cast_preprocess_done_evt", batch_idx=batch_idx, stage="dispatch")
         before_dispatch_evt = _record_stage_event()
         token_dispatch_input = build_token_dispatch_input(
             fused_experts_input=fused_experts_input,
@@ -362,35 +369,43 @@ class MoECommMethod(ABC):
         _maybe_log_micro_batch_stage(
             batch_idx,
             "dispatch",
-            waits=["cast_preprocess_done_evt"],
+            waits=[],
             records=["dispatch_done_evt"],
         )
         token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
         current_events.dispatch_done_evt = _record_stage_event()
 
+        _wait_for_stage_event(current_events.dispatch_done_evt, "dispatch_done_evt", batch_idx=batch_idx, stage="gmm1")
         mlp_compute_input = build_mlp_compute_input(
             fused_experts_input=fused_experts_input,
             token_dispatch_output=token_dispatch_output,
             use_fusion_ops=self.use_fusion_ops,
         )
         mlp_stage_outputs = build_mlp_stage_outputs(mlp_compute_input=mlp_compute_input)
-        _maybe_log_micro_batch_stage(batch_idx, "gmm1", waits=["dispatch_done_evt"], records=["gmm1_done_evt"])
+        _maybe_log_micro_batch_stage(batch_idx, "gmm1", waits=[], records=["gmm1_done_evt"])
         current_events.gmm1_done_evt = _record_stage_event()
-        _maybe_log_micro_batch_stage(batch_idx, "swiglu", waits=["gmm1_done_evt"], records=["swiglu_done_evt"])
+
+        _wait_for_stage_event(current_events.gmm1_done_evt, "gmm1_done_evt", batch_idx=batch_idx, stage="swiglu")
+        _maybe_log_micro_batch_stage(batch_idx, "swiglu", waits=[], records=["swiglu_done_evt"])
         current_events.swiglu_done_evt = _record_stage_event()
+
+        _wait_for_stage_event(current_events.swiglu_done_evt, "swiglu_done_evt", batch_idx=batch_idx, stage="gmm2_downproj")
+        if previous_events is not None:
+            _wait_for_stage_event(previous_events.gmm2_downproj_done_evt, "batch0.gmm2_downproj_done_evt", batch_idx=batch_idx, stage="gmm2_downproj")
         _maybe_log_micro_batch_stage(
             batch_idx,
             "gmm2_downproj",
-            waits=["swiglu_done_evt"],
+            waits=[],
             records=["gmm2_downproj_done_evt"],
         )
         current_events.gmm2_downproj_done_evt = _record_stage_event()
 
+        _wait_for_stage_event(current_events.gmm2_downproj_done_evt, "gmm2_downproj_done_evt", batch_idx=batch_idx, stage="combine")
         before_combine_evt = _record_stage_event()
         _maybe_log_micro_batch_stage(
             batch_idx,
             "combine",
-            waits=["gmm2_downproj_done_evt"],
+            waits=[],
             records=["combine_done_evt"],
         )
         routed_out = self.token_dispatcher.token_combine(

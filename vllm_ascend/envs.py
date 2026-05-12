@@ -113,6 +113,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_DEBUG": lambda: bool(
         int(os.getenv("VLLM_ASCEND_MOE_PREFILL_MICROBATCH_DEBUG", "0"))
     ),
+    # Routed MoE prefill micro-batch mode.
+    # off: disabled, always keep the legacy routed path.
+    # auto: enable conservative micro-batch when the threshold is met, otherwise fallback to legacy.
+    # conservative: force the conservative two-way micro-batch path.
+    "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MODE": lambda: os.getenv(
+        "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MODE", ""
+    ).strip().lower(),
     # Minimum routed tokens required to enable Prefill micro-batch mode.
     "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS", "2")

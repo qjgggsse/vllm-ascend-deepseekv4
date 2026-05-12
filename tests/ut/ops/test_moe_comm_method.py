@@ -8,6 +8,7 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import (
     AllGatherCommImpl,
     AlltoAllCommImpl,
     MC2CommImpl,
+    build_micro_batch_plan,
 )
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEAllGatherCombineMetadata,
@@ -171,6 +172,57 @@ class TestMoECommMethod(TestBase):
         # Verify prepare was called with correct arguments
         mock_pf_instance.prepare.assert_called_once_with(
             hidden_states, router_logits, False, False, QuantType.NONE)
+
+    @patch.dict(
+        "os.environ",
+        {
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MODE": "off",
+            "VLLM_ASCEND_ENABLE_MOE_PREFILL_MICROBATCH_OVERLAP": "1",
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS": "2",
+        },
+        clear=False,
+    )
+    def test_build_micro_batch_plan_mode_off(self):
+        plan = build_micro_batch_plan(8)
+
+        self.assertFalse(plan.enabled)
+        self.assertEqual(plan.batch_size, 1)
+        self.assertEqual(plan.split_sizes, (8, 0))
+        self.assertEqual(plan.mode, "legacy")
+
+    @patch.dict(
+        "os.environ",
+        {
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MODE": "auto",
+            "VLLM_ASCEND_ENABLE_MOE_PREFILL_MICROBATCH_OVERLAP": "1",
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS": "8",
+        },
+        clear=False,
+    )
+    def test_build_micro_batch_plan_auto_fallback(self):
+        plan = build_micro_batch_plan(4)
+
+        self.assertFalse(plan.enabled)
+        self.assertEqual(plan.batch_size, 1)
+        self.assertEqual(plan.split_sizes, (4, 0))
+        self.assertEqual(plan.mode, "legacy")
+
+    @patch.dict(
+        "os.environ",
+        {
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MODE": "conservative",
+            "VLLM_ASCEND_ENABLE_MOE_PREFILL_MICROBATCH_OVERLAP": "0",
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS": "8",
+        },
+        clear=False,
+    )
+    def test_build_micro_batch_plan_conservative(self):
+        plan = build_micro_batch_plan(4)
+
+        self.assertTrue(plan.enabled)
+        self.assertEqual(plan.batch_size, 2)
+        self.assertEqual(plan.split_sizes, (2, 2))
+        self.assertEqual(plan.mode, "conservative")
 
     @patch('vllm_ascend.ascend_forward_context.get_forward_context')
     @patch(

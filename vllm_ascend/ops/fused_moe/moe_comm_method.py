@@ -23,7 +23,7 @@ from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 import vllm_ascend.envs as envs_ascend
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops.fused_moe.moe_mlp import build_mlp_stage_outputs, unified_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEFusedExpertsInput,
@@ -99,7 +99,7 @@ class FusedExpertsResult:
     expert_tokens: torch.Tensor | None = None
 
 
-_MoECommMethods: dict[MoECommType | None, "MoECommMethod"] = {}
+_MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
 
 
 def _record_stage_event(stream: torch.npu.Stream | None = None) -> torch.npu.Event:
@@ -148,10 +148,25 @@ def _maybe_log_micro_batch_stage(
     )
 
 
+def _resolve_micro_batch_mode() -> str:
+    configured_mode = envs_ascend.VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MODE
+    if configured_mode:
+        if configured_mode not in {"off", "auto", "conservative"}:
+            logger.warning(
+                "Invalid VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MODE=%s, fallback to auto",
+                configured_mode,
+            )
+            return "auto"
+        return configured_mode
+    if envs_ascend.VLLM_ASCEND_ENABLE_MOE_PREFILL_MICROBATCH_OVERLAP:
+        return "auto"
+    return "off"
+
+
 def build_micro_batch_plan(num_tokens: int) -> MicroBatchPlan:
-    enabled = envs_ascend.VLLM_ASCEND_ENABLE_MOE_PREFILL_MICROBATCH_OVERLAP
+    mode = _resolve_micro_batch_mode()
     min_tokens = envs_ascend.VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS
-    if not enabled or num_tokens < min_tokens:
+    if mode == "off" or (mode == "auto" and num_tokens < min_tokens):
         return MicroBatchPlan(
             enabled=False,
             batch_size=1,
@@ -175,7 +190,10 @@ def build_micro_batch_plan(num_tokens: int) -> MicroBatchPlan:
     return plan
 
 
-def _split_optional_tensor(value: torch.Tensor | None, plan: MicroBatchPlan) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+def _split_optional_tensor(
+    value: torch.Tensor | None,
+    plan: MicroBatchPlan,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     if value is None:
         return None, None
     if not plan.enabled or value.dim() == 0:
@@ -249,7 +267,7 @@ def merge_micro_batch_outputs(outputs: list[torch.Tensor]) -> torch.Tensor:
     return torch.cat(outputs, dim=0)
 
 
-def get_moe_comm_method(moe_comm_type: MoECommType | None) -> "MoECommMethod" | None:
+def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | None:
     return _MoECommMethods.get(moe_comm_type)
 
 
@@ -343,11 +361,21 @@ class MoECommMethod(ABC):
             current_events = MicroBatchEvents()
 
         if previous_events is not None:
-            _wait_for_stage_event(previous_events.dispatch_done_evt, "batch0.dispatch_done_evt", batch_idx=batch_idx, stage="routing_topk")
+            _wait_for_stage_event(
+                previous_events.dispatch_done_evt,
+                "batch0.dispatch_done_evt",
+                batch_idx=batch_idx,
+                stage="routing_topk",
+            )
         _maybe_log_micro_batch_stage(batch_idx, "routing_topk", waits=[], records=["routing_topk_done_evt"])
         current_events.routing_topk_done_evt = _record_stage_event()
 
-        _wait_for_stage_event(current_events.routing_topk_done_evt, "routing_topk_done_evt", batch_idx=batch_idx, stage="cast_preprocess")
+        _wait_for_stage_event(
+            current_events.routing_topk_done_evt,
+            "routing_topk_done_evt",
+            batch_idx=batch_idx,
+            stage="cast_preprocess",
+        )
         _maybe_log_micro_batch_stage(
             batch_idx,
             "cast_preprocess",
@@ -360,7 +388,12 @@ class MoECommMethod(ABC):
         if fused_experts_input.routing.log2phy is not None:
             routed_topk_ids = fused_experts_input.routing.log2phy[routed_topk_ids]
 
-        _wait_for_stage_event(current_events.cast_preprocess_done_evt, "cast_preprocess_done_evt", batch_idx=batch_idx, stage="dispatch")
+        _wait_for_stage_event(
+            current_events.cast_preprocess_done_evt,
+            "cast_preprocess_done_evt",
+            batch_idx=batch_idx,
+            stage="dispatch",
+        )
         before_dispatch_evt = _record_stage_event()
         token_dispatch_input = build_token_dispatch_input(
             fused_experts_input=fused_experts_input,
@@ -375,7 +408,12 @@ class MoECommMethod(ABC):
         token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
         current_events.dispatch_done_evt = _record_stage_event()
 
-        _wait_for_stage_event(current_events.dispatch_done_evt, "dispatch_done_evt", batch_idx=batch_idx, stage="gmm1")
+        _wait_for_stage_event(
+            current_events.dispatch_done_evt,
+            "dispatch_done_evt",
+            batch_idx=batch_idx,
+            stage="gmm1",
+        )
         mlp_compute_input = build_mlp_compute_input(
             fused_experts_input=fused_experts_input,
             token_dispatch_output=token_dispatch_output,
@@ -385,13 +423,28 @@ class MoECommMethod(ABC):
         _maybe_log_micro_batch_stage(batch_idx, "gmm1", waits=[], records=["gmm1_done_evt"])
         current_events.gmm1_done_evt = _record_stage_event()
 
-        _wait_for_stage_event(current_events.gmm1_done_evt, "gmm1_done_evt", batch_idx=batch_idx, stage="swiglu")
+        _wait_for_stage_event(
+            current_events.gmm1_done_evt,
+            "gmm1_done_evt",
+            batch_idx=batch_idx,
+            stage="swiglu",
+        )
         _maybe_log_micro_batch_stage(batch_idx, "swiglu", waits=[], records=["swiglu_done_evt"])
         current_events.swiglu_done_evt = _record_stage_event()
 
-        _wait_for_stage_event(current_events.swiglu_done_evt, "swiglu_done_evt", batch_idx=batch_idx, stage="gmm2_downproj")
+        _wait_for_stage_event(
+            current_events.swiglu_done_evt,
+            "swiglu_done_evt",
+            batch_idx=batch_idx,
+            stage="gmm2_downproj",
+        )
         if previous_events is not None:
-            _wait_for_stage_event(previous_events.gmm2_downproj_done_evt, "batch0.gmm2_downproj_done_evt", batch_idx=batch_idx, stage="gmm2_downproj")
+            _wait_for_stage_event(
+                previous_events.gmm2_downproj_done_evt,
+                "batch0.gmm2_downproj_done_evt",
+                batch_idx=batch_idx,
+                stage="gmm2_downproj",
+            )
         _maybe_log_micro_batch_stage(
             batch_idx,
             "gmm2_downproj",
@@ -400,7 +453,12 @@ class MoECommMethod(ABC):
         )
         current_events.gmm2_downproj_done_evt = _record_stage_event()
 
-        _wait_for_stage_event(current_events.gmm2_downproj_done_evt, "gmm2_downproj_done_evt", batch_idx=batch_idx, stage="combine")
+        _wait_for_stage_event(
+            current_events.gmm2_downproj_done_evt,
+            "gmm2_downproj_done_evt",
+            batch_idx=batch_idx,
+            stage="combine",
+        )
         before_combine_evt = _record_stage_event()
         _maybe_log_micro_batch_stage(
             batch_idx,

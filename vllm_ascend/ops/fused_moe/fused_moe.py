@@ -42,15 +42,14 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import (
     FusedExpertsResult,
     setup_moe_comm_method,
 )
-from vllm_ascend.ops.fused_moe.runner import AscendMoERunner
-from vllm_ascend.quantization.quant_type import QuantType
-from vllm_ascend.utils import enable_sp, get_compressed_expert_map
 from vllm_ascend.worker.model_runner_v1 import tensor_model_parallel_all_reduce
 from vllm_ascend.worker.shared_expert_utils import (
     npu_stream_switch,
     shared_expert_dp_enabled,
     shared_experts_calculation_stream,
 )
+from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.utils import enable_sp, get_compressed_expert_map
 
 
 @dataclass
@@ -185,15 +184,24 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             activation=activation,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
+            swiglu_limit=getattr(layer, "swiglu_limit", 0),
         )
         return moe_comm_method.fused_experts(fused_experts_input=fused_experts_input)
 
 
 class AscendFusedMoE(FusedMoE):
     gate_stream = None
+    moe_counter = -1
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        AscendFusedMoE.moe_counter += 1
+        self.moe_instance_id = AscendFusedMoE.moe_counter
+        self._routed_input_transform = getattr(self, "_routed_input_transform", None)
+        self._shared_experts = getattr(self, "_shared_experts", None)
+        self._gate = getattr(self, "_gate", None)
+        self.shared_experts = getattr(self, "shared_experts", None)
+        self.router = getattr(self, "router", None)
         self.global_expert_map = None
         self._expert_map = None
         self.log2phy = None

@@ -48,8 +48,8 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
 from vllm_ascend.quantization.quant_type import QuantType
 
 MICRO_BATCH_STAGE_NAMES = (
-    "routing_topk",
-    "cast_preprocess",
+    "routing_ready",
+    "dispatch_ready",
     "dispatch",
     "gmm1",
     "swiglu",
@@ -57,7 +57,6 @@ MICRO_BATCH_STAGE_NAMES = (
     "combine",
     "finalize_merge",
 )
-
 
 @dataclass
 class MicroBatchEvents:
@@ -95,6 +94,8 @@ class FusedExpertsResult:
     routed_out: torch.Tensor
     before_dispatch_evt: torch.npu.Event | None = None
     before_combine_evt: torch.npu.Event | None = None
+    allow_shared_part1_evt: torch.npu.Event | None = None
+    allow_shared_part2_evt: torch.npu.Event | None = None
     group_list_type: int = 1
     expert_tokens: torch.Tensor | None = None
 
@@ -163,10 +164,19 @@ def _resolve_micro_batch_mode() -> str:
     return "off"
 
 
-def build_micro_batch_plan(num_tokens: int) -> MicroBatchPlan:
+def build_micro_batch_plan(
+    num_tokens: int,
+    *,
+    is_prefill: bool = True,
+    supports_staged_mlp: bool = True,
+    supports_micro_batch: bool = True,
+    has_shared_experts: bool = False,
+    moe_comm_type: MoECommType | None = None,
+) -> MicroBatchPlan:
     mode = _resolve_micro_batch_mode()
     min_tokens = envs_ascend.VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS
-    if mode == "off" or (mode == "auto" and num_tokens < min_tokens):
+
+    def _legacy_plan() -> MicroBatchPlan:
         return MicroBatchPlan(
             enabled=False,
             batch_size=1,
@@ -176,8 +186,32 @@ def build_micro_batch_plan(num_tokens: int) -> MicroBatchPlan:
             mode="legacy",
         )
 
+    if mode == "off":
+        return _legacy_plan()
+
+    if not is_prefill:
+        return _legacy_plan()
+
+    if not supports_micro_batch:
+        return _legacy_plan()
+
+    if not supports_staged_mlp:
+        return _legacy_plan()
+
+    if has_shared_experts and moe_comm_type == MoECommType.FUSED_MC2:
+        return _legacy_plan()
+
+    if moe_comm_type == MoECommType.FUSED_MC2:
+        return _legacy_plan()
+
+    if mode == "auto" and num_tokens < min_tokens:
+        return _legacy_plan()
+
     batch0 = (num_tokens + 1) // 2
     batch1 = num_tokens - batch0
+    if batch1 <= 0:
+        return _legacy_plan()
+
     plan = MicroBatchPlan(
         enabled=True,
         batch_size=2,
@@ -273,9 +307,13 @@ def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | No
 
 def setup_moe_comm_method(moe_config):
     _MoECommMethods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)
+    _MoECommMethods[MoECommType.ALLTOALL].moe_comm_type = MoECommType.ALLTOALL
     _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
+    _MoECommMethods[MoECommType.ALLGATHER].moe_comm_type = MoECommType.ALLGATHER
     _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)
+    _MoECommMethods[MoECommType.MC2].moe_comm_type = MoECommType.MC2
     _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
+    _MoECommMethods[MoECommType.FUSED_MC2].moe_comm_type = MoECommType.FUSED_MC2
 
 
 def set_gmmswigluquant_method():
@@ -290,6 +328,7 @@ class MoECommMethod(ABC):
 
     def __init__(self, moe_config: FusedMoEConfig):
         self.moe_config = moe_config
+        self.moe_comm_type: MoECommType | None = None
         self.token_dispatcher = self._get_token_dispatcher()
         self.prepare_finalize = self._get_prepare_finalize()
         self.use_fusion_ops = set_gmmswigluquant_method()
@@ -324,8 +363,24 @@ class MoECommMethod(ABC):
         fused_experts_input: MoEFusedExpertsInput,
     ):
         assert fused_experts_input.hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16, torch.int8]
-        plan = build_micro_batch_plan(fused_experts_input.hidden_states.shape[0])
+        supports_staged_mlp = not fused_experts_input.quant.is_quant
+        plan = build_micro_batch_plan(
+            fused_experts_input.hidden_states.shape[0],
+            is_prefill=True,
+            supports_staged_mlp=supports_staged_mlp,
+            supports_micro_batch=not isinstance(self, FusedMC2CommImpl),
+            has_shared_experts=False,
+            moe_comm_type=getattr(self, "moe_comm_type", None),
+        )
         fused_inputs = build_micro_batch_fused_inputs(fused_experts_input, plan)
+
+        if envs_ascend.VLLM_ASCEND_MOE_PREFILL_MICROBATCH_DEBUG and not plan.enabled:
+            logger.info(
+                "[MB-PLAN] fallback legacy total_tokens=%s staged_mlp=%s comm=%s",
+                fused_experts_input.hidden_states.shape[0],
+                int(supports_staged_mlp),
+                getattr(self, "moe_comm_type", None),
+            )
 
         if len(fused_inputs) == 1:
             return self._run_stage_pipeline(fused_inputs[0], batch_idx=0)
@@ -341,12 +396,18 @@ class MoECommMethod(ABC):
             )
             results.append(result)
 
+        merged_expert_tokens = None
+        if all(result.expert_tokens is not None for result in results):
+            merged_expert_tokens = torch.cat([result.expert_tokens for result in results], dim=0)
+
         return FusedExpertsResult(
             routed_out=merge_micro_batch_outputs([result.routed_out for result in results]),
             before_dispatch_evt=results[0].before_dispatch_evt,
             before_combine_evt=results[-1].before_combine_evt,
-            group_list_type=results[-1].group_list_type,
-            expert_tokens=results[-1].expert_tokens,
+            allow_shared_part1_evt=results[0].allow_shared_part1_evt,
+            allow_shared_part2_evt=results[-1].allow_shared_part2_evt,
+            group_list_type=results[0].group_list_type,
+            expert_tokens=merged_expert_tokens if merged_expert_tokens is not None else results[0].expert_tokens,
         )
 
     def _run_stage_pipeline(
@@ -365,20 +426,20 @@ class MoECommMethod(ABC):
                 previous_events.dispatch_done_evt,
                 "batch0.dispatch_done_evt",
                 batch_idx=batch_idx,
-                stage="routing_topk",
+                stage="routing_ready",
             )
-        _maybe_log_micro_batch_stage(batch_idx, "routing_topk", waits=[], records=["routing_topk_done_evt"])
+        _maybe_log_micro_batch_stage(batch_idx, "routing_ready", waits=[], records=["routing_topk_done_evt"])
         current_events.routing_topk_done_evt = _record_stage_event()
 
         _wait_for_stage_event(
             current_events.routing_topk_done_evt,
             "routing_topk_done_evt",
             batch_idx=batch_idx,
-            stage="cast_preprocess",
+            stage="dispatch_ready",
         )
         _maybe_log_micro_batch_stage(
             batch_idx,
-            "cast_preprocess",
+            "dispatch_ready",
             waits=[],
             records=["cast_preprocess_done_evt"],
         )
@@ -471,11 +532,15 @@ class MoECommMethod(ABC):
             combine_metadata=token_dispatch_output.combine_metadata,
         )
         current_events.combine_done_evt = _record_stage_event()
+        allow_shared_part1_evt = current_events.dispatch_done_evt
+        allow_shared_part2_evt = current_events.combine_done_evt
 
         return FusedExpertsResult(
             routed_out=routed_out,
             before_dispatch_evt=before_dispatch_evt,
             before_combine_evt=before_combine_evt,
+            allow_shared_part1_evt=allow_shared_part1_evt,
+            allow_shared_part2_evt=allow_shared_part2_evt,
             group_list_type=token_dispatch_output.group_list_type,
             expert_tokens=token_dispatch_output.group_list,
         )

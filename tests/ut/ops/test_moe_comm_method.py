@@ -4,6 +4,7 @@ import torch
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from tests.ut.base import TestBase
+from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops.fused_moe.moe_comm_method import (
     AllGatherCommImpl,
     AlltoAllCommImpl,
@@ -223,6 +224,268 @@ class TestMoECommMethod(TestBase):
         self.assertEqual(plan.batch_size, 2)
         self.assertEqual(plan.split_sizes, (2, 2))
         self.assertEqual(plan.mode, "conservative")
+
+    @patch.dict(
+        "os.environ",
+        {
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MODE": "conservative",
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS": "2",
+        },
+        clear=False,
+    )
+    def test_build_micro_batch_plan_non_prefill_fallback(self):
+        plan = build_micro_batch_plan(8, is_prefill=False)
+        self.assertFalse(plan.enabled)
+        self.assertEqual(plan.mode, "legacy")
+        self.assertEqual(plan.split_sizes, (8, 0))
+
+    @patch.dict(
+        "os.environ",
+        {
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MODE": "conservative",
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS": "2",
+        },
+        clear=False,
+    )
+    def test_build_micro_batch_plan_fused_mc2_fallback(self):
+        plan = build_micro_batch_plan(8, moe_comm_type=MoECommType.FUSED_MC2)
+        self.assertFalse(plan.enabled)
+        self.assertEqual(plan.mode, "legacy")
+        self.assertEqual(plan.split_sizes, (8, 0))
+
+    @patch.dict(
+        "os.environ",
+        {
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MODE": "conservative",
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS": "2",
+        },
+        clear=False,
+    )
+    def test_build_micro_batch_plan_no_staged_mlp_fallback(self):
+        plan = build_micro_batch_plan(8, supports_staged_mlp=False)
+        self.assertFalse(plan.enabled)
+        self.assertEqual(plan.mode, "legacy")
+        self.assertEqual(plan.split_sizes, (8, 0))
+
+    @patch.dict(
+        "os.environ",
+        {
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MODE": "conservative",
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS": "2",
+        },
+        clear=False,
+    )
+    def test_build_micro_batch_plan_zero_second_batch_fallback(self):
+        plan = build_micro_batch_plan(1)
+        self.assertFalse(plan.enabled)
+        self.assertEqual(plan.mode, "legacy")
+        self.assertEqual(plan.split_sizes, (1, 0))
+
+    @patch.dict(
+        "os.environ",
+        {
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MODE": "conservative",
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS": "2",
+        },
+        clear=False,
+    )
+    def test_build_micro_batch_plan_invalid_support_fallback(self):
+        plan = build_micro_batch_plan(8, supports_micro_batch=False)
+        self.assertFalse(plan.enabled)
+        self.assertEqual(plan.mode, "legacy")
+        self.assertEqual(plan.split_sizes, (8, 0))
+
+    @patch.dict(
+        "os.environ",
+        {
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MODE": "conservative",
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS": "2",
+        },
+        clear=False,
+    )
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.build_mlp_stage_outputs")
+    @patch('vllm_ascend.ascend_forward_context.get_forward_context')
+    @patch(
+        "vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather"
+    )
+    @patch(
+        "vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithAllGather"
+    )
+    @patch("torch.npu.current_stream", MagicMock())
+    def test_fused_experts_method_shared_anchor_events(
+        self,
+        mock_token_dispatcher,
+        mock_prepare_finalize,
+        mock_get_forward_context,
+        mock_build_mlp_stage_outputs,
+    ):
+        mock_context = MagicMock()
+        mock_context.moe_comm_method = "all_gather"
+        mock_get_forward_context.return_value = mock_context
+
+        mock_pf_instance = MagicMock()
+        mock_pf_instance.prepare.return_value = MoEPrepareOutput(
+            hidden_states=torch.randn(4, 8),
+            router_logits=torch.randn(4, 2),
+            mc2_mask=None,
+            padded_hidden_states_shape=None,
+        )
+        mock_prepare_finalize.return_value = mock_pf_instance
+
+        mock_td_instance = MagicMock()
+        dispatch_topk_weights = torch.tensor([[0.5, 0.5], [0.3, 0.7], [0.8, 0.2], [0.6, 0.4]])
+        mock_td_instance.token_dispatch.return_value = MoETokenDispatchOutput(
+            hidden_states=torch.randn(6, 8),
+            group_list=torch.tensor([2, 2, 2]),
+            group_list_type=1,
+            combine_metadata=MoEAllGatherCombineMetadata(
+                topk_weights=dispatch_topk_weights,
+                expanded_row_idx=torch.arange(8, dtype=torch.int32),
+                restore_shape=torch.Size([4, 8]),
+            ),
+        )
+        mock_td_instance.token_combine.return_value = torch.randn(4, 8)
+        mock_token_dispatcher.return_value = mock_td_instance
+
+        mock_build_mlp_stage_outputs.return_value = MagicMock(
+            gmm2_output=torch.randn(6, 8),
+        )
+
+        comm_impl = AllGatherCommImpl(self.moe_config)
+        result = comm_impl.fused_experts(
+            fused_experts_input=MoEFusedExpertsInput(
+                hidden_states=torch.randn(4, 8).contiguous(),
+                topk_weights=dispatch_topk_weights,
+                topk_ids=torch.tensor([[0, 1], [1, 2], [2, 0], [1, 1]]),
+                weights=MoEWeights(
+                    w1=[torch.randn(16, 8).contiguous()],
+                    w2=[torch.randn(16, 8).contiguous()],
+                ),
+                routing=MoERoutingParams(
+                    expert_map=None,
+                    global_redundant_expert_num=0,
+                    mc2_mask=None,
+                    apply_router_weight_on_input=False,
+                ),
+                activation="silu",
+                need_trans=False,
+                dynamic_eplb=False,
+                quant=MoEQuantParams(),
+            )
+        )
+
+        self.assertIsNotNone(result.before_dispatch_evt)
+        self.assertIsNotNone(result.before_combine_evt)
+        self.assertIsNotNone(result.allow_shared_part1_evt)
+        self.assertIsNotNone(result.allow_shared_part2_evt)
+        self.assertEqual(result.group_list_type, 1)
+        self.assertTrue(torch.equal(result.expert_tokens, torch.tensor([2, 2, 2])))
+
+        mock_build_mlp_stage_outputs.assert_called_once()
+        mock_td_instance.token_combine.assert_called_once()
+
+    @patch.dict(
+        "os.environ",
+        {
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MODE": "conservative",
+            "VLLM_ASCEND_MOE_PREFILL_MICROBATCH_MIN_TOKENS": "2",
+        },
+        clear=False,
+    )
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.build_mlp_stage_outputs")
+    @patch('vllm_ascend.ascend_forward_context.get_forward_context')
+    @patch(
+        "vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather"
+    )
+    @patch(
+        "vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithAllGather"
+    )
+    @patch("torch.npu.current_stream", MagicMock())
+    def test_fused_experts_method_multibatch_merge_metadata(
+        self,
+        mock_token_dispatcher,
+        mock_prepare_finalize,
+        mock_get_forward_context,
+        mock_build_mlp_stage_outputs,
+    ):
+        mock_context = MagicMock()
+        mock_context.moe_comm_method = "all_gather"
+        mock_get_forward_context.return_value = mock_context
+
+        mock_pf_instance = MagicMock()
+        mock_pf_instance.prepare.return_value = MoEPrepareOutput(
+            hidden_states=torch.randn(4, 8),
+            router_logits=torch.randn(4, 2),
+            mc2_mask=None,
+            padded_hidden_states_shape=None,
+        )
+        mock_prepare_finalize.return_value = mock_pf_instance
+
+        mock_td_instance = MagicMock()
+        mock_td_instance.token_dispatch.side_effect = [
+            MoETokenDispatchOutput(
+                hidden_states=torch.randn(3, 8),
+                group_list=torch.tensor([1, 2]),
+                group_list_type=1,
+                combine_metadata=MoEAllGatherCombineMetadata(
+                    topk_weights=torch.randn(2, 2),
+                    expanded_row_idx=torch.arange(4, dtype=torch.int32),
+                    restore_shape=torch.Size([2, 8]),
+                ),
+            ),
+            MoETokenDispatchOutput(
+                hidden_states=torch.randn(3, 8),
+                group_list=torch.tensor([3, 4]),
+                group_list_type=1,
+                combine_metadata=MoEAllGatherCombineMetadata(
+                    topk_weights=torch.randn(2, 2),
+                    expanded_row_idx=torch.arange(4, dtype=torch.int32),
+                    restore_shape=torch.Size([2, 8]),
+                ),
+            ),
+        ]
+        mock_td_instance.token_combine.side_effect = [torch.randn(2, 8), torch.randn(2, 8)]
+        mock_token_dispatcher.return_value = mock_td_instance
+
+        mock_build_mlp_stage_outputs.side_effect = [
+            MagicMock(gmm2_output=torch.randn(3, 8)),
+            MagicMock(gmm2_output=torch.randn(3, 8)),
+        ]
+
+        comm_impl = AllGatherCommImpl(self.moe_config)
+        result = comm_impl.fused_experts(
+            fused_experts_input=MoEFusedExpertsInput(
+                hidden_states=torch.randn(4, 8).contiguous(),
+                topk_weights=torch.randn(4, 2),
+                topk_ids=torch.tensor([[0, 1], [1, 2], [2, 0], [1, 1]]),
+                weights=MoEWeights(
+                    w1=[torch.randn(16, 8).contiguous()],
+                    w2=[torch.randn(16, 8).contiguous()],
+                ),
+                routing=MoERoutingParams(
+                    expert_map=None,
+                    global_redundant_expert_num=0,
+                    mc2_mask=None,
+                    apply_router_weight_on_input=False,
+                ),
+                activation="silu",
+                need_trans=False,
+                dynamic_eplb=False,
+                quant=MoEQuantParams(),
+            )
+        )
+
+        self.assertEqual(result.routed_out.shape, (4, 8))
+        self.assertEqual(result.group_list_type, 1)
+        self.assertTrue(torch.equal(result.expert_tokens, torch.tensor([1, 2, 3, 4])))
+        self.assertEqual(mock_td_instance.token_dispatch.call_count, 2)
+        self.assertEqual(mock_td_instance.token_combine.call_count, 2)
+        self.assertEqual(mock_build_mlp_stage_outputs.call_count, 2)
+        self.assertIsNotNone(result.allow_shared_part1_evt)
+        self.assertIsNotNone(result.allow_shared_part2_evt)
+        self.assertIsNotNone(result.before_dispatch_evt)
+        self.assertIsNotNone(result.before_combine_evt)
+        self.assertFalse(result.expert_tokens is None)
 
     @patch('vllm_ascend.ascend_forward_context.get_forward_context')
     @patch(

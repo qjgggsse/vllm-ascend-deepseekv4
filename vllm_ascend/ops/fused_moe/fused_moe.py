@@ -47,6 +47,7 @@ from vllm_ascend.utils import (
     ACL_FORMAT_FRACTAL_NZ,
     enable_sp,
     maybe_trans_nz,
+    microbatch_overlap_stream,
     npu_stream_switch,
     shared_expert_dp_enabled,
     shared_experts_calculation_stream,
@@ -67,6 +68,52 @@ class FusedMoEEvents:
     before_dispatch: torch.npu.Event | None = field(default=None)
     before_gmm2: torch.npu.Event | None = field(default=None)
     before_combine: torch.npu.Event | None = field(default=None)
+
+
+class MicrobatchOverlapEvents:
+    """Shared event container for microbatch overlap between batch0, batch1, and shared experts.
+
+    batch0 writes events that batch1 and shared experts can wait on.
+    batch1 writes events that shared experts can wait on.
+    All three streams share this single instance to coordinate execution timing.
+
+    Compatible with the existing FusedMoEEvents interface used by _forward_shared_experts:
+      - Non-microbatch mode: FusedMoEEvents is constructed directly from fused_experts results
+      - Microbatch mode: FusedMoEEvents is constructed via to_shared_expert_events() with
+        different event sources, but _forward_shared_experts logic remains unchanged.
+    """
+
+    def __init__(self):
+        # Events written by batch0 (in forward_impl), consumed by batch1
+        self.b0_quant_done: torch.npu.Event | None = None          # batch0 quant完成 → batch1开始quant
+        self.b0_allgather_done: torch.npu.Event | None = None      # batch0 prepare完成(含allgather) → batch1开始allgather+select_experts
+        self.b0_unpermute_done: torch.npu.Event | None = None      # batch0 fused_experts完成(含token_combine) → batch1开始fused_experts
+
+        # Events written by batch1 (in forward_impl), consumed by shared experts
+        self.b1_quant_done: torch.npu.Event | None = None          # batch1 quant完成 → shared expert开始Quant+gate_up_proj(Matmul)
+        self.b1_unpermute_done: torch.npu.Event | None = None      # batch1 fused_experts完成(含token_combine) → shared expert开始swiglu+down_proj(Matmul)
+
+    def to_shared_expert_events(self) -> FusedMoEEvents:
+        """Convert to FusedMoEEvents for _forward_shared_experts consumption.
+
+        Mapping (microbatch mode):
+          before_routed_experts → b1_quant_done  (shared expert Quant starts after batch1 quant)
+          before_dispatch       → b1_quant_done  (shared expert gate_up_proj starts after batch1 quant)
+          before_gmm2           → b1_unpermute_done (shared expert swiglu starts after batch1 unpermute)
+          before_combine        → b1_unpermute_done (shared expert down_proj starts after batch1 unpermute)
+
+        Non-microbatch mode (for reference, handled in forward_impl directly):
+          before_routed_experts → before_routed_experts event
+          before_dispatch       → fused_experts_results.before_dispatch_evt
+          before_gmm2           → fused_experts_results.before_gmm2_evt
+          before_combine        → fused_experts_results.before_combine_evt
+        """
+        return FusedMoEEvents(
+            before_routed_experts=self.b1_quant_done,
+            before_dispatch=self.b1_quant_done,
+            before_gmm2=self.b1_unpermute_done,
+            before_combine=self.b1_unpermute_done,
+        )
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -457,7 +504,9 @@ class AscendFusedMoE(FusedMoE):
         )
 
     def forward_impl(  # type: ignore[override]
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor,
+        return_with_event: bool = False,
+        overlap_events=None, microbatch_role: str | None = None,
     ) -> torch.Tensor | FusedMoEResult:
         assert self.quant_method is not None
 
@@ -524,6 +573,8 @@ class AscendFusedMoE(FusedMoE):
             replace_allreduce=_EXTRA_CTX.flash_comm_v1_enabled,
             enable_shared_expert_dp=self.enable_shared_expert_dp,
             quant_type=self.quant_type,
+            overlap_events=overlap_events,
+            microbatch_role=microbatch_role,
         )
         hidden_states = prepare_output.hidden_states
         router_logits = prepare_output.router_logits
@@ -531,9 +582,24 @@ class AscendFusedMoE(FusedMoE):
         padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
         pertoken_scale = prepare_output.pertoken_scale
 
+        # Microbatch overlap: event after prepare (quant+allgather done)
+        if overlap_events is not None:
+            if microbatch_role == "batch0":
+                # batch0 allgather done → batch1 can start allgather+select_experts
+                overlap_events.b0_allgather_done = torch.npu.current_stream().record_event()
+            elif microbatch_role == "batch1":
+                # batch1 waits for batch0 allgather done before proceeding to select_experts
+                pass  # batch1 already waited before calling forward_impl
+
         # Make sure the default stream waits for the gate stream to finish.
         if self.multistream_overlap_gate:
             torch.npu.current_stream().wait_stream(AscendFusedMoE.gate_stream)
+
+        # Microbatch overlap: batch1 waits for batch0 fused_experts to complete
+        # before starting its own select_experts + fused_experts
+        if overlap_events is not None and microbatch_role == "batch1":
+            if overlap_events.b0_unpermute_done is not None:
+                torch.npu.current_stream().wait_event(overlap_events.b0_unpermute_done)
 
         # Matrix multiply.
         fused_experts_results: FusedExpertsResult = self.quant_method.apply(
@@ -579,6 +645,16 @@ class AscendFusedMoE(FusedMoE):
                 self.load_counter.add_(1)
             else:
                 self.moe_load.add_(local_load)
+
+        # Microbatch overlap: event after fused_experts (select_experts + dispatch + MLP + token_combine done)
+        if overlap_events is not None:
+            if microbatch_role == "batch0":
+                # batch0 unpermute done → batch1 can start fused_experts
+                overlap_events.b0_unpermute_done = torch.npu.current_stream().record_event()
+            elif microbatch_role == "batch1":
+                # batch1 unpermute done → shared expert can start swiglu+down_proj
+                overlap_events.b1_unpermute_done = torch.npu.current_stream().record_event()
+
         routed_out = _EXTRA_CTX.moe_comm_method.finalize(
             hidden_states=fused_experts_results.routed_out,
             reduce_results=self.reduce_results,
@@ -811,6 +887,12 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         else:
             before_routed_experts = torch.npu.current_stream().record_event()
 
+        # Microbatch overlap path: split before prepare(quant+allgather)
+        if self._should_use_microbatch_overlap(hidden_states):
+            return self._forward_with_microbatch_overlap(
+                hidden_states, router_logits, before_routed_experts
+            )
+
         fused_moe_results = AscendFusedMoE.forward_impl(
             self,
             hidden_states=hidden_states,
@@ -837,4 +919,102 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
                 ),
             )
 
+        return shared_out, routed_out
+
+    def _should_use_microbatch_overlap(self, hidden_states: torch.Tensor) -> bool:
+        """Check if microbatch overlap should be used."""
+        ascend_config = get_ascend_config()
+        if not ascend_config.multistream_prefill_moe_overlap:
+            return False
+        if not isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl):
+            return False
+        if hidden_states.shape[0] <= 1:
+            return False
+        return True
+
+    def _forward_with_microbatch_overlap(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        before_routed_experts: torch.npu.Event,
+    ):
+        """Prefill MOE microbatch overlap implementation.
+
+        batch0 and batch1 both call AscendFusedMoE.forward_impl() with shared
+        overlap_events, maintaining the same processing flow as baseline.
+        Events are recorded/waited inside forward_impl at key points:
+          - After quant (in prepare): b0_quant_done / b1_quant_done
+          - After prepare (allgather done): b0_allgather_done
+          - After fused_experts (token_combine done): b0_unpermute_done / b1_unpermute_done
+
+        batch1 waits for batch0's events before proceeding at each stage,
+        achieving true parallel execution with fine-grained event control.
+        """
+        num_tokens = hidden_states.shape[0]
+        mid = num_tokens // 2
+
+        # --- Split inputs ---
+        hidden_states_b0 = hidden_states[:mid]
+        hidden_states_b1 = hidden_states[mid:]
+        router_logits_b0 = router_logits[:mid]
+        router_logits_b1 = router_logits[mid:]
+
+        mb_stream = microbatch_overlap_stream()
+
+        # Shared event container — batch0 writes, batch1 reads; batch1 writes, shared expert reads
+        overlap_events = MicrobatchOverlapEvents()
+
+        # ================================================================
+        # Main Stream: batch0 full pipeline via forward_impl
+        # Events are recorded inside forward_impl at key points
+        # ================================================================
+        fused_moe_results_b0 = AscendFusedMoE.forward_impl(
+            self,
+            hidden_states=hidden_states_b0,
+            router_logits=router_logits_b0,
+            return_with_event=True,
+            overlap_events=overlap_events,
+            microbatch_role="batch0",
+        )
+        routed_out_b0 = fused_moe_results_b0.routed_out
+
+        # ================================================================
+        # Microbatch Stream: batch1 full pipeline via forward_impl
+        # batch1 waits for batch0 events inside forward_impl (via prepare)
+        # and at key synchronization points
+        # ================================================================
+        with npu_stream_switch(mb_stream):
+            fused_moe_results_b1 = AscendFusedMoE.forward_impl(
+                self,
+                hidden_states=hidden_states_b1,
+                router_logits=router_logits_b1,
+                return_with_event=True,
+                overlap_events=overlap_events,
+                microbatch_role="batch1",
+            )
+            routed_out_b1 = fused_moe_results_b1.routed_out
+
+        # batch1 fully done event
+        evt_b1_all_done = mb_stream.record_event()
+
+        # ================================================================
+        # Shared Expert Stream: overlap with batch1 pipeline
+        # ================================================================
+        if self._shared_experts is not None:
+            shared_out = self._forward_shared_experts(
+                hidden_states,
+                overlap_events.to_shared_expert_events(),
+            )
+        else:
+            shared_out = None
+
+        # ================================================================
+        # Synchronize: wait for both batches to complete, then merge
+        # ================================================================
+        torch.npu.current_stream().wait_event(evt_b1_all_done)
+
+        routed_out = torch.cat([routed_out_b0, routed_out_b1], dim=0)
+
+        if shared_out is None:
+            return routed_out
         return shared_out, routed_out

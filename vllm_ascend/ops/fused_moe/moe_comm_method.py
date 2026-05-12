@@ -97,6 +97,8 @@ class MoECommMethod(ABC):
         enable_shared_expert_dp: bool = False,
         replace_allreduce: bool = False,
         quant_type: QuantType = QuantType.NONE,
+        overlap_events=None,
+        microbatch_role: str | None = None,
     ) -> MoEPrepareOutput:
         return self.prepare_finalize.prepare(
             hidden_states,
@@ -104,6 +106,8 @@ class MoECommMethod(ABC):
             enable_shared_expert_dp,
             replace_allreduce,
             quant_type,
+            overlap_events,
+            microbatch_role,
         )
 
     def finalize(

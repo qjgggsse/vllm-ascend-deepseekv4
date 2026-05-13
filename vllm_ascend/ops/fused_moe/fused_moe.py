@@ -86,7 +86,7 @@ class MicrobatchOverlapEvents:
     def __init__(self):
         # Events written by batch0 (in forward_impl), consumed by batch1
         self.b0_quant_done: torch.npu.Event | None = None          # batch0 quant完成 → batch1开始quant
-        self.b0_allgather_done: torch.npu.Event | None = None      # batch0 prepare完成(含allgather) → batch1开始allgather+select_experts
+        self.b0_allgather_done: torch.npu.Event | None = None      # batch0 select_experts完成(=before_dispatch) → batch1开始allgather
         self.b0_unpermute_done: torch.npu.Event | None = None      # batch0 fused_experts完成(含token_combine) → batch1开始fused_experts
 
         # Events written by batch1 (in forward_impl), consumed by shared experts
@@ -582,14 +582,8 @@ class AscendFusedMoE(FusedMoE):
         padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
         pertoken_scale = prepare_output.pertoken_scale
 
-        # Microbatch overlap: event after prepare (quant+allgather done)
-        if overlap_events is not None:
-            if microbatch_role == "batch0":
-                # batch0 allgather done → batch1 can start allgather+select_experts
-                overlap_events.b0_allgather_done = torch.npu.current_stream().record_event()
-            elif microbatch_role == "batch1":
-                # batch1 waits for batch0 allgather done before proceeding to select_experts
-                pass  # batch1 already waited before calling forward_impl
+        # Microbatch overlap: b0_allgather_done is now set after apply()
+        # (reusing before_dispatch_evt timing = after select_experts, before token_dispatch)
 
         # Make sure the default stream waits for the gate stream to finish.
         if self.multistream_overlap_gate:
@@ -649,6 +643,9 @@ class AscendFusedMoE(FusedMoE):
         # Microbatch overlap: event after fused_experts (select_experts + dispatch + MLP + token_combine done)
         if overlap_events is not None:
             if microbatch_role == "batch0":
+                # Reuse before_dispatch_evt (= after select_experts) so batch1's allgather
+                # can start once batch0's topk_renormalize is done
+                overlap_events.b0_allgather_done = fused_experts_results.before_dispatch_evt
                 # batch0 unpermute done → batch1 can start fused_experts
                 overlap_events.b0_unpermute_done = torch.npu.current_stream().record_event()
             elif microbatch_role == "batch1":

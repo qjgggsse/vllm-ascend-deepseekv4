@@ -115,7 +115,15 @@ class MoECommMethod(ABC):
         hidden_states: torch.Tensor,
         reduce_results: bool,
         padded_hidden_states_shape: torch.Size | None = None,
+        overlap_events=None,
+        microbatch_role: str | None = None,
     ) -> torch.Tensor:
+        if overlap_events is not None:
+            if microbatch_role == "batch0":
+                overlap_events.b0_unpermute_done = torch.npu.current_stream().record_event()
+            elif microbatch_role == "batch1":
+                overlap_events.b1_unpermute_done = torch.npu.current_stream().record_event()
+
         hidden_states = self.prepare_finalize.finalize(hidden_states, reduce_results, padded_hidden_states_shape)
         return hidden_states
 
@@ -145,6 +153,13 @@ class MoECommMethod(ABC):
             token_dispatch_output=token_dispatch_output,
             use_fusion_ops=self.use_fusion_ops,
         )
+
+        # Microbatch overlap: batch1 waits for batch0 fused_experts to complete
+        overlap_events = getattr(self, '_overlap_events', None)
+        microbatch_role = getattr(self, '_microbatch_role', None)
+        if overlap_events is not None and microbatch_role == "batch1":
+            if overlap_events.b0_unpermute_done is not None:
+                torch.npu.current_stream().wait_event(overlap_events.b0_unpermute_done)
 
         mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
 

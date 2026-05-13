@@ -589,11 +589,11 @@ class AscendFusedMoE(FusedMoE):
         if self.multistream_overlap_gate:
             torch.npu.current_stream().wait_stream(AscendFusedMoE.gate_stream)
 
-        # Microbatch overlap: batch1 waits for batch0 fused_experts to complete
-        # before starting its own select_experts + fused_experts
-        if overlap_events is not None and microbatch_role == "batch1":
-            if overlap_events.b0_unpermute_done is not None:
-                torch.npu.current_stream().wait_event(overlap_events.b0_unpermute_done)
+        # Microbatch overlap: set overlap state on moe_comm_method instance
+        # so fused_experts() can read it (avoids changing apply() signatures)
+        if overlap_events is not None:
+            _EXTRA_CTX.moe_comm_method._overlap_events = overlap_events
+            _EXTRA_CTX.moe_comm_method._microbatch_role = microbatch_role
 
         # Matrix multiply.
         fused_experts_results: FusedExpertsResult = self.quant_method.apply(
@@ -646,16 +646,16 @@ class AscendFusedMoE(FusedMoE):
                 # Reuse before_dispatch_evt (= after select_experts) so batch1's allgather
                 # can start once batch0's topk_renormalize is done
                 overlap_events.b0_allgather_done = fused_experts_results.before_dispatch_evt
-                # batch0 unpermute done → batch1 can start fused_experts
-                overlap_events.b0_unpermute_done = torch.npu.current_stream().record_event()
-            elif microbatch_role == "batch1":
-                # batch1 unpermute done → shared expert can start swiglu+down_proj
-                overlap_events.b1_unpermute_done = torch.npu.current_stream().record_event()
+            # Clear instance attributes
+            _EXTRA_CTX.moe_comm_method._overlap_events = None
+            _EXTRA_CTX.moe_comm_method._microbatch_role = None
 
         routed_out = _EXTRA_CTX.moe_comm_method.finalize(
             hidden_states=fused_experts_results.routed_out,
             reduce_results=self.reduce_results,
             padded_hidden_states_shape=padded_hidden_states_shape,
+            overlap_events=overlap_events,
+            microbatch_role=microbatch_role,
         )
 
         if return_with_event:

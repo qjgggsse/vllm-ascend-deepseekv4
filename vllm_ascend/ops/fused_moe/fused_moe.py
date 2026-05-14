@@ -987,8 +987,18 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             )
             routed_out_b1 = fused_moe_results_b1.routed_out
 
-        # batch1 fully done event
+        # batch1 fully done event (before RS)
         evt_b1_all_done = mb_stream.record_event()
+
+        # ================================================================
+        # Deferred ReduceScatter: execute RS after both AG-b0 and AG-b1
+        # are in HCCL queue, avoiding RS-b0 blocking AG-b1.
+        # ================================================================
+        moe_comm_method = _EXTRA_CTX.moe_comm_method
+        routed_out_b0 = moe_comm_method.prepare_finalize.finalize(
+            routed_out_b0, self.reduce_results, None)
+        routed_out_b1 = moe_comm_method.prepare_finalize.finalize(
+            routed_out_b1, self.reduce_results, None)
 
         # ================================================================
         # Shared Expert Stream: overlap with batch1 pipeline

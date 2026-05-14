@@ -993,10 +993,12 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         # ================================================================
         # Deferred ReduceScatter: execute RS after both AG-b0 and AG-b1
         # are in HCCL queue, avoiding RS-b0 blocking AG-b1.
+        # Wait for batch1 to complete before RS-b1 on main stream.
         # ================================================================
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         routed_out_b0 = moe_comm_method.prepare_finalize.finalize(
             routed_out_b0, self.reduce_results, None)
+        torch.npu.current_stream().wait_event(evt_b1_all_done)
         routed_out_b1 = moe_comm_method.prepare_finalize.finalize(
             routed_out_b1, self.reduce_results, None)
 
@@ -1012,10 +1014,8 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             shared_out = None
 
         # ================================================================
-        # Synchronize: wait for both batches to complete, then merge
+        # Merge results
         # ================================================================
-        torch.npu.current_stream().wait_event(evt_b1_all_done)
-
         routed_out = torch.cat([routed_out_b0, routed_out_b1], dim=0)
 
         if shared_out is None:

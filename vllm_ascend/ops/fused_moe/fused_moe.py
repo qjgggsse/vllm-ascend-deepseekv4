@@ -640,12 +640,8 @@ class AscendFusedMoE(FusedMoE):
             else:
                 self.moe_load.add_(local_load)
 
-        # Microbatch overlap: event after fused_experts (select_experts + dispatch + MLP + token_combine done)
+        # Microbatch overlap: clear instance attributes after apply
         if overlap_events is not None:
-            if microbatch_role == "batch0":
-                # Reuse before_dispatch_evt (= after select_experts) so batch1's allgather
-                # can start once batch0's topk_renormalize is done
-                overlap_events.b0_allgather_done = fused_experts_results.before_dispatch_evt
             # Clear instance attributes
             _EXTRA_CTX.moe_comm_method._overlap_events = None
             _EXTRA_CTX.moe_comm_method._microbatch_role = None

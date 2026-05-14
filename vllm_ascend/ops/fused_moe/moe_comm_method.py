@@ -138,6 +138,13 @@ class MoECommMethod(ABC):
         assert moe_comm_method is not None, "Missing communication context"
 
         before_dispatch_evt = torch.npu.current_stream().record_event()
+
+        # Microbatch overlap: batch0 record后立即赋值，batch1的allgather可及时wait
+        overlap_events = getattr(self, '_overlap_events', None)
+        microbatch_role = getattr(self, '_microbatch_role', None)
+        if overlap_events is not None and microbatch_role == "batch0":
+            overlap_events.b0_allgather_done = before_dispatch_evt
+
         routed_topk_ids = fused_experts_input.topk_ids
         if fused_experts_input.routing.log2phy is not None:
             routed_topk_ids = fused_experts_input.routing.log2phy[routed_topk_ids]

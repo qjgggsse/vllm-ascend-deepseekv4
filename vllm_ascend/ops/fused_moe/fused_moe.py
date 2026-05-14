@@ -595,6 +595,11 @@ class AscendFusedMoE(FusedMoE):
             _EXTRA_CTX.moe_comm_method._overlap_events = overlap_events
             _EXTRA_CTX.moe_comm_method._microbatch_role = microbatch_role
 
+        # Microbatch overlap: batch1 waits for batch0 to complete before select_experts
+        if overlap_events is not None and microbatch_role == "batch1":
+            if overlap_events.b0_unpermute_done is not None:
+                torch.npu.current_stream().wait_event(overlap_events.b0_unpermute_done)
+
         # Matrix multiply.
         fused_experts_results: FusedExpertsResult = self.quant_method.apply(
             layer=self,

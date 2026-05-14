@@ -164,13 +164,6 @@ class MoECommMethod(ABC):
             use_fusion_ops=self.use_fusion_ops,
         )
 
-        # Microbatch overlap: batch1 waits for batch0 fused_experts to complete
-        overlap_events = getattr(self, '_overlap_events', None)
-        microbatch_role = getattr(self, '_microbatch_role', None)
-        if overlap_events is not None and microbatch_role == "batch1":
-            if overlap_events.b0_unpermute_done is not None:
-                torch.npu.current_stream().wait_event(overlap_events.b0_unpermute_done)
-
         mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
 
         before_combine_evt = torch.npu.current_stream().record_event()

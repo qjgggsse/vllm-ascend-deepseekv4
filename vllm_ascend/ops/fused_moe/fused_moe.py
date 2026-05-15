@@ -949,7 +949,9 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         achieving true parallel execution with fine-grained event control.
         """
         num_tokens = hidden_states.shape[0]
-        mid = num_tokens // 2
+        split_ratio = get_ascend_config().multistream_prefill_moe_overlap_split_ratio
+        mid = int(num_tokens * split_ratio)
+        mid = max(1, min(mid, num_tokens - 1))
 
         # --- Split inputs ---
         hidden_states_b0 = hidden_states[:mid]

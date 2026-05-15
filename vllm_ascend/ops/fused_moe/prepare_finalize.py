@@ -390,11 +390,6 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 # batch1 quant done → shared expert can start quant+gate_up_proj
                 overlap_events.b1_quant_done = torch.npu.current_stream().record_event()
 
-        # Microbatch overlap: batch1 waits for batch0 select_experts done before allgather
-        if overlap_events is not None and microbatch_role == "batch1":
-            if overlap_events.b0_allgather_done is not None:
-                torch.npu.current_stream().wait_event(overlap_events.b0_allgather_done)
-
         if self.multistream_overlap_gate:
             assert PrepareAndFinalize.quant_stream is not None
             PrepareAndFinalize.quant_stream.wait_stream(torch.npu.current_stream())

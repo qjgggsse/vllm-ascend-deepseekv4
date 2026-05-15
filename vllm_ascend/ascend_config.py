@@ -90,6 +90,10 @@ class AscendConfig:
         self.multistream_prefill_moe_overlap_split_ratio = additional_config.get(
             "multistream_prefill_moe_overlap_split_ratio", 0.5
         )
+        if not 0 < self.multistream_prefill_moe_overlap_split_ratio < 1:
+            raise ValueError(
+                "multistream_prefill_moe_overlap_split_ratio must be in the open interval (0, 1)."
+            )
         self.recompute_scheduler_enable = additional_config.get("recompute_scheduler_enable", False)
         self.enable_cpu_binding = additional_config.get("enable_cpu_binding", True)
         self.multistream_dsa_preprocess = additional_config.get(

@@ -123,8 +123,8 @@ class MoECommMethod(ABC):
                 overlap_events.b0_unpermute_done = torch.npu.current_stream().record_event()
             elif microbatch_role == "batch1":
                 overlap_events.b1_unpermute_done = torch.npu.current_stream().record_event()
-            # Skip ReduceScatter here; it will be done later in
-            # _forward_with_microbatch_overlap to avoid RS-b0 blocking AG-b1.
+            # Skip ReduceScatter here. It is deferred to
+            # _forward_with_microbatch_overlap so RS-b0 does not block AG-b1.
             return hidden_states
 
         hidden_states = self.prepare_finalize.finalize(hidden_states, reduce_results, padded_hidden_states_shape)
@@ -142,11 +142,8 @@ class MoECommMethod(ABC):
 
         before_dispatch_evt = torch.npu.current_stream().record_event()
 
-        # Microbatch overlap: batch0 record后立即赋值，batch1的allgather可及时wait
         overlap_events = getattr(self, '_overlap_events', None)
         microbatch_role = getattr(self, '_microbatch_role', None)
-        if overlap_events is not None and microbatch_role == "batch0":
-            overlap_events.b0_allgather_done = before_dispatch_evt
 
         routed_topk_ids = fused_experts_input.topk_ids
         if fused_experts_input.routing.log2phy is not None:

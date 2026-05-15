@@ -368,7 +368,6 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor, quant_type=QuantType.NONE,
         overlap_events=None, microbatch_role: str | None = None,
     ) -> MoEPrepareOutput:
-        # Microbatch overlap: batch1 waits for batch0 quant done before starting its own quant
         if overlap_events is not None and microbatch_role == "batch1":
             if overlap_events.b0_quant_done is not None:
                 torch.npu.current_stream().wait_event(overlap_events.b0_quant_done)
@@ -381,13 +380,10 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             # per-token activations in prepare. Keep quantization in the MoE MLP path.
             pass
 
-        # Microbatch overlap: event control between quant and allgather
         if overlap_events is not None:
             if microbatch_role == "batch0":
-                # batch0 quant done → batch1 can start quant
                 overlap_events.b0_quant_done = torch.npu.current_stream().record_event()
             elif microbatch_role == "batch1":
-                # batch1 quant done → shared expert can start quant+gate_up_proj
                 overlap_events.b1_quant_done = torch.npu.current_stream().record_event()
 
         if self.multistream_overlap_gate:

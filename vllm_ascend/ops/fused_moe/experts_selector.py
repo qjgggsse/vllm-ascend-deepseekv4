@@ -253,9 +253,9 @@ def _select_experts_with_fusion_ops(
                 input_ids = splitted_input[tp_rank].contiguous()
             input_ids = torch.where(input_ids == -1, 0, input_ids)
 
-            # Microbatch overlap: input_ids may be larger than router_logits
-            # when hidden_states was split before prepare (allgather).
-            # Slice input_ids to match the actual token count.
+            # In microbatch mode, input_ids can be longer than router_logits
+            # because hidden_states was split before prepare/all-gather.
+            # Slice input_ids to the current token count.
             num_tokens = router_logits.shape[0]
             if input_ids.numel() > num_tokens:
                 input_ids = input_ids[:num_tokens]

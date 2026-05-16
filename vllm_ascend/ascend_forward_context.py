@@ -69,6 +69,7 @@ def set_ascend_forward_context(
         forward_context.draft_attn_metadatas = draft_attn_metadatas
 
         forward_context.input_ids = input_ids
+        forward_context.moe_local_input_ids = None
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 

@@ -254,12 +254,6 @@ def _select_experts_with_fusion_ops(
                 input_ids = splitted_input[tp_rank].contiguous()
             input_ids = torch.where(input_ids == -1, 0, input_ids)
 
-            if getattr(forward_context, "moe_local_input_ids", None) is not None:
-                # When a local microbatch input_ids view is active, keep the
-                # gathered input_ids length aligned with the current router view.
-                num_tokens = router_logits.shape[0]
-                if input_ids.numel() > num_tokens:
-                    input_ids = input_ids[:num_tokens]
         else:
             input_ids = None
             tid2eid_ones = None

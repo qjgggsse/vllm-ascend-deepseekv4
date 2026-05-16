@@ -70,6 +70,7 @@ def set_ascend_forward_context(
 
         forward_context.input_ids = input_ids
         forward_context.moe_local_input_ids = None
+        forward_context.moe_local_max_tokens_across_dp = None
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 

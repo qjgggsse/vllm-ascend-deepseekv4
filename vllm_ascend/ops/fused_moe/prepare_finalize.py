@@ -435,7 +435,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
 
             self.num_tokens = hidden_states.shape[0]
-            pad_size = max_tokens_across_dp - self.num_tokens
+            pad_size = max_tokens_across_dp - input_ids.shape[0]
             if pad_size > 0:
                 hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_size))
                 router_logits = nn.functional.pad(router_logits, (0, 0, 0, pad_size))
@@ -479,7 +479,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 max_tokens_across_dp = int(moe_local_num_tokens_across_dp.max().item())
             else:
                 max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
-            pad_size = max_tokens_across_dp - self.num_tokens
+            pad_size = max_tokens_across_dp - input_ids.shape[0]
             if pad_size > 0:
                 input_ids = nn.functional.pad(input_ids, (0, pad_size))
 

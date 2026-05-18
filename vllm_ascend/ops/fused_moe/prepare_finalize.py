@@ -398,6 +398,15 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         # TODO(fuzhihong): To adapt to self.num_token in the all_gather_input_id_with_dp_group method,
         #  when flashcomm1 is used and dp = N(N >=2).
         self.num_tokens = hidden_states.shape[0]
+        if overlap_events is not None:
+            if microbatch_role == "batch0":
+                self.b0_num_tokens = self.num_tokens
+            elif microbatch_role == "batch1":
+                self.b1_num_tokens = self.num_tokens
+
+        if microbatch_role is None:
+            self.b0_num_tokens = None
+            self.b1_num_tokens = None
 
         if pertoken_scale is not None:
             pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(pertoken_scale, True, True)
@@ -471,12 +480,20 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         )
 
     def all_gather_input_id_with_dp_group(
-        self, input_ids: torch.Tensor, num_tokens_across_dp: torch.Tensor | None = None) -> torch.Tensor:
+        self,
+        input_ids: torch.Tensor,
+        num_tokens_across_dp: torch.Tensor | None = None,
+        microbatch_role: str | None = None,
+    ) -> torch.Tensor:
         target_num_tokens = None
         if num_tokens_across_dp is not None:
             target_num_tokens = int(num_tokens_across_dp.max().item())
         elif self.moe_config.dp_size > 1:
             target_num_tokens = _EXTRA_CTX.max_tokens_across_dp
+        elif microbatch_role == "batch0" and getattr(self, "b0_num_tokens", None) is not None:
+            target_num_tokens = self.b0_num_tokens
+        elif microbatch_role == "batch1" and getattr(self, "b1_num_tokens", None) is not None:
+            target_num_tokens = self.b1_num_tokens
         elif getattr(self, "num_tokens", None) is not None:
             target_num_tokens = self.num_tokens
 
@@ -486,6 +503,8 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         pad_size = target_num_tokens - input_ids.shape[0]
         if pad_size > 0:
             input_ids = nn.functional.pad(input_ids, (0, pad_size))
+        elif pad_size < 0:
+            input_ids = input_ids[:target_num_tokens]
 
         if self.moe_config.dp_size > 1:
             input_ids = self.moe_config.dp_group.all_gather(input_ids, 0)

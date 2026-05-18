@@ -245,8 +245,12 @@ def _select_experts_with_fusion_ops(
             if forward_context.moe_comm_type == MoECommType.ALLGATHER:
                 prepare_finalize = forward_context.moe_comm_method.prepare_finalize
                 input_ids_before_gather = input_ids.shape[0]
+                microbatch_role = getattr(forward_context.moe_comm_method, "_microbatch_role", None)
                 input_ids = prepare_finalize.all_gather_input_id_with_dp_group(
-                    input_ids, num_tokens_across_dp=num_tokens_across_dp)
+                    input_ids,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    microbatch_role=microbatch_role,
+                )
                 if input_ids.numel() != router_logits.shape[0]:
                     local_tokens = getattr(prepare_finalize, "num_tokens", None)
                     raise RuntimeError(

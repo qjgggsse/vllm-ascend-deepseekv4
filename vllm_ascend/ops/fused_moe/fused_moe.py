@@ -880,6 +880,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
                 hidden_states, router_logits, before_routed_experts
             )
 
+        forward_context = get_forward_context()
         fused_moe_results = AscendFusedMoE.forward_impl(
             self,
             hidden_states=hidden_states,

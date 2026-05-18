@@ -472,9 +472,10 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
 
     def all_gather_input_id_with_dp_group(
         self, input_ids: torch.Tensor) -> torch.Tensor:
-        if self.moe_config.dp_size > 1:
-            forward_context = get_forward_context()
-            moe_local_num_tokens_across_dp = getattr(forward_context, "moe_local_num_tokens_across_dp", None)
+        forward_context = get_forward_context()
+        moe_local_num_tokens_across_dp = getattr(forward_context, "moe_local_num_tokens_across_dp", None)
+        should_gather = moe_local_num_tokens_across_dp is not None or self.moe_config.dp_size > 1
+        if should_gather:
             if moe_local_num_tokens_across_dp is not None:
                 max_tokens_across_dp = int(moe_local_num_tokens_across_dp.max().item())
             else:

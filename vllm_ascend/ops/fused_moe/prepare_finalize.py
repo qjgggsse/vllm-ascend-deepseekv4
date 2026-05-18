@@ -472,16 +472,22 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
 
     def all_gather_input_id_with_dp_group(
         self, input_ids: torch.Tensor, num_tokens_across_dp: torch.Tensor | None = None) -> torch.Tensor:
-        should_gather = num_tokens_across_dp is not None or self.moe_config.dp_size > 1
-        if should_gather:
-            if num_tokens_across_dp is not None:
-                max_tokens_across_dp = int(num_tokens_across_dp.max().item())
-            else:
-                max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
-            pad_size = max_tokens_across_dp - input_ids.shape[0]
-            if pad_size > 0:
-                input_ids = nn.functional.pad(input_ids, (0, pad_size))
+        target_num_tokens = None
+        if num_tokens_across_dp is not None:
+            target_num_tokens = int(num_tokens_across_dp.max().item())
+        elif self.moe_config.dp_size > 1:
+            target_num_tokens = _EXTRA_CTX.max_tokens_across_dp
+        elif getattr(self, "num_tokens", None) is not None:
+            target_num_tokens = self.num_tokens
 
+        if target_num_tokens is None:
+            return input_ids
+
+        pad_size = target_num_tokens - input_ids.shape[0]
+        if pad_size > 0:
+            input_ids = nn.functional.pad(input_ids, (0, pad_size))
+
+        if self.moe_config.dp_size > 1:
             input_ids = self.moe_config.dp_group.all_gather(input_ids, 0)
         return input_ids
 

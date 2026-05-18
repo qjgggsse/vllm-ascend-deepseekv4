@@ -1006,16 +1006,12 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
 
         evt_b1_all_done = mb_stream.record_event()
 
-        # Defer ReduceScatter so RS-b0 does not block AG-b1, then run RS-b1
-        # only after batch1 finishes on the microbatch stream.
+        # Defer batch1 finalize so batch0 stays on the main path and shared
+        # experts can consume batch1 progress before batch1 tail communication.
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         routed_out_b0 = moe_comm_method.prepare_finalize.finalize(
             routed_out_b0, self.reduce_results, None)
-        torch.npu.current_stream().wait_event(evt_b1_all_done)
-        routed_out_b1 = moe_comm_method.prepare_finalize.finalize(
-            routed_out_b1, self.reduce_results, None)
 
-        # Overlap shared experts with the batch1 pipeline.
         if self._shared_experts is not None:
             shared_out = self._forward_shared_experts(
                 hidden_states,
@@ -1023,6 +1019,12 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             )
         else:
             shared_out = None
+
+        torch.npu.current_stream().wait_event(evt_b1_all_done)
+        routed_out_b1 = moe_comm_method.prepare_finalize.finalize(
+            routed_out_b1, self.reduce_results, None)
+
+        # Concatenate routed outputs after both finalize stages complete.
 
         routed_out = torch.cat([routed_out_b0, routed_out_b1], dim=0)
 

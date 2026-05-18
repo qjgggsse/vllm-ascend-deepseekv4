@@ -155,6 +155,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         input_ids = getattr(moe_comm_method, "_microbatch_input_ids", None)
         if input_ids is None:
             input_ids = forward_context.input_ids
+        num_tokens_across_dp = getattr(moe_comm_method, "_microbatch_num_tokens_across_dp", None)
+        if num_tokens_across_dp is None:
+            num_tokens_across_dp = getattr(forward_context, "num_tokens_across_dp", None)
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -169,7 +172,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             e_score_correction_bias=e_score_correction_bias,
             global_num_experts=global_num_experts,
             tid2eid=self.tid2eid,
-            input_ids=input_ids)
+            input_ids=input_ids,
+            num_tokens_across_dp=num_tokens_across_dp)
         
         if layer.vllm_config.model_config is not None and layer.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()

@@ -46,6 +46,7 @@ def select_experts(
     global_num_experts: int = -1,
     input_ids: Optional[torch.Tensor] = None,
     tid2eid: Optional[torch.Tensor] = None,
+    num_tokens_across_dp: Optional[torch.Tensor] = None,
 ):
     """
     Fused experts with select experts.
@@ -96,6 +97,7 @@ def select_experts(
             global_num_experts=global_num_experts,
             tid2eid=tid2eid,
             input_ids=input_ids,
+            num_tokens_across_dp=num_tokens_across_dp,
         )
     else:
         topk_weights, topk_ids = _native_select_experts(
@@ -226,7 +228,8 @@ def _select_experts_with_fusion_ops(
     routed_scaling_factor=1.0,
     global_num_experts: int = -1,
     tid2eid=None,
-    input_ids=None
+    input_ids=None,
+    num_tokens_across_dp=None,
     ):
     topk_group = topk_group if topk_group is not None else 1
     num_expert_group = num_expert_group if num_expert_group is not None else 1
@@ -234,11 +237,8 @@ def _select_experts_with_fusion_ops(
     if scoring_func == "sqrtsoftplus":
         if tid2eid is not None:
             forward_context = get_forward_context()
-            microbatch_input_ids = getattr(forward_context.moe_comm_method, "_microbatch_input_ids", None)
-            if microbatch_input_ids is None:
+            if input_ids is None:
                 input_ids = forward_context.input_ids
-            else:
-                input_ids = microbatch_input_ids
             input_ids = input_ids.to(torch.int64)
             # tid2eid_ones = torch.ones(tid2eid.shape[0],tid2eid.shape[1],device=router_logits.device,dtype=torch.int32)
             tid2eid_ones = tid2eid.to(torch.int32)
@@ -246,18 +246,15 @@ def _select_experts_with_fusion_ops(
                 prepare_finalize = forward_context.moe_comm_method.prepare_finalize
                 input_ids_before_gather = input_ids.shape[0]
                 input_ids = prepare_finalize.all_gather_input_id_with_dp_group(
-                    input_ids)
+                    input_ids, num_tokens_across_dp=num_tokens_across_dp)
                 if input_ids.numel() != router_logits.shape[0]:
                     local_tokens = getattr(prepare_finalize, "num_tokens", None)
-                    moe_local_num_tokens_across_dp = getattr(
-                        forward_context, "moe_local_num_tokens_across_dp", None
-                    )
                     raise RuntimeError(
                         "MoE hash routing input length mismatch after input_ids gather: "
                         f"before_gather={input_ids_before_gather}, after_gather={input_ids.numel()}, "
                         f"router_rows={router_logits.shape[0]}, moe_comm_type={forward_context.moe_comm_type}, "
                         f"dp_size={prepare_finalize.moe_config.dp_size}, local_tokens={local_tokens}, "
-                        f"moe_local_num_tokens_across_dp={moe_local_num_tokens_across_dp}, "
+                        f"num_tokens_across_dp={num_tokens_across_dp}, "
                         f"max_tokens_across_dp={getattr(forward_context, 'max_tokens_across_dp', None)}"
                     )
             else:

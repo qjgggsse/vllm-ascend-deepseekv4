@@ -242,8 +242,22 @@ def _select_experts_with_fusion_ops(
             tid2eid_ones = tid2eid.to(torch.int32)
             if forward_context.moe_comm_type == MoECommType.ALLGATHER:
                 prepare_finalize = forward_context.moe_comm_method.prepare_finalize
+                input_ids_before_gather = input_ids.shape[0]
                 input_ids = prepare_finalize.all_gather_input_id_with_dp_group(
                     input_ids)
+                if input_ids.numel() != router_logits.shape[0]:
+                    local_tokens = getattr(prepare_finalize, "num_tokens", None)
+                    moe_local_num_tokens_across_dp = getattr(
+                        forward_context, "moe_local_num_tokens_across_dp", None
+                    )
+                    raise RuntimeError(
+                        "MoE hash routing input length mismatch after input_ids gather: "
+                        f"before_gather={input_ids_before_gather}, after_gather={input_ids.numel()}, "
+                        f"router_rows={router_logits.shape[0]}, moe_comm_type={forward_context.moe_comm_type}, "
+                        f"dp_size={prepare_finalize.moe_config.dp_size}, local_tokens={local_tokens}, "
+                        f"moe_local_num_tokens_across_dp={moe_local_num_tokens_across_dp}, "
+                        f"max_tokens_across_dp={getattr(forward_context, 'max_tokens_across_dp', None)}"
+                    )
             else:
                 input_ids = forward_context.moe_comm_method.pad_and_split_input_ids(
                     input_ids)

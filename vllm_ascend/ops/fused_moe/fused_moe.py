@@ -151,7 +151,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
         forward_context = get_forward_context()
-        input_ids = getattr(forward_context, "moe_local_input_ids", None)
+        moe_comm_method = _EXTRA_CTX.moe_comm_method
+        input_ids = getattr(moe_comm_method, "_microbatch_input_ids", None)
         if input_ids is None:
             input_ids = forward_context.input_ids
         topk_weights, topk_ids = select_experts(
@@ -939,8 +940,9 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         router_logits_b1 = router_logits[mid:]
 
         forward_context = get_forward_context()
-        original_moe_local_input_ids = getattr(forward_context, "moe_local_input_ids", None)
-        original_moe_local_num_tokens_across_dp = getattr(forward_context, "moe_local_num_tokens_across_dp", None)
+        moe_comm_method = _EXTRA_CTX.moe_comm_method
+        original_microbatch_input_ids = getattr(moe_comm_method, "_microbatch_input_ids", None)
+        original_microbatch_num_tokens_across_dp = getattr(moe_comm_method, "_microbatch_num_tokens_across_dp", None)
         original_input_ids = forward_context.input_ids
         input_ids_b0 = original_input_ids[:mid] if original_input_ids is not None else None
         input_ids_b1 = original_input_ids[mid:] if original_input_ids is not None else None
@@ -963,8 +965,8 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         overlap_events = MicrobatchOverlapEvents()
 
         # Run the full batch0 pipeline on the main stream.
-        forward_context.moe_local_input_ids = input_ids_b0
-        forward_context.moe_local_num_tokens_across_dp = num_tokens_across_dp_b0
+        moe_comm_method._microbatch_input_ids = input_ids_b0
+        moe_comm_method._microbatch_num_tokens_across_dp = num_tokens_across_dp_b0
         fused_moe_results_b0 = AscendFusedMoE.forward_impl(
             self,
             hidden_states=hidden_states_b0,
@@ -976,8 +978,8 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         routed_out_b0 = fused_moe_results_b0.routed_out
 
         # Run the full batch1 pipeline on the microbatch stream.
-        forward_context.moe_local_input_ids = input_ids_b1
-        forward_context.moe_local_num_tokens_across_dp = num_tokens_across_dp_b1
+        moe_comm_method._microbatch_input_ids = input_ids_b1
+        moe_comm_method._microbatch_num_tokens_across_dp = num_tokens_across_dp_b1
         with npu_stream_switch(mb_stream):
             fused_moe_results_b1 = AscendFusedMoE.forward_impl(
                 self,
@@ -989,8 +991,8 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             )
             routed_out_b1 = fused_moe_results_b1.routed_out
 
-        forward_context.moe_local_input_ids = original_moe_local_input_ids
-        forward_context.moe_local_num_tokens_across_dp = original_moe_local_num_tokens_across_dp
+        moe_comm_method._microbatch_input_ids = original_microbatch_input_ids
+        moe_comm_method._microbatch_num_tokens_across_dp = original_microbatch_num_tokens_across_dp
         evt_b1_all_done = mb_stream.record_event()
 
         # Defer ReduceScatter so RS-b0 does not block AG-b1, then run RS-b1

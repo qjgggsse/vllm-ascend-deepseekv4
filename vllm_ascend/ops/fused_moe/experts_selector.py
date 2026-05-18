@@ -234,9 +234,11 @@ def _select_experts_with_fusion_ops(
     if scoring_func == "sqrtsoftplus":
         if tid2eid is not None:
             forward_context = get_forward_context()
-            input_ids = getattr(forward_context, "moe_local_input_ids", None)
-            if input_ids is None:
+            microbatch_input_ids = getattr(forward_context.moe_comm_method, "_microbatch_input_ids", None)
+            if microbatch_input_ids is None:
                 input_ids = forward_context.input_ids
+            else:
+                input_ids = microbatch_input_ids
             input_ids = input_ids.to(torch.int64)
             # tid2eid_ones = torch.ones(tid2eid.shape[0],tid2eid.shape[1],device=router_logits.device,dtype=torch.int32)
             tid2eid_ones = tid2eid.to(torch.int32)

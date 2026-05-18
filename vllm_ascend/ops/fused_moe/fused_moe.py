@@ -151,13 +151,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
         forward_context = get_forward_context()
-        moe_comm_method = _EXTRA_CTX.moe_comm_method
-        input_ids = getattr(moe_comm_method, "_microbatch_input_ids", None)
-        if input_ids is None:
-            input_ids = forward_context.input_ids
-        num_tokens_across_dp = getattr(moe_comm_method, "_microbatch_num_tokens_across_dp", None)
-        if num_tokens_across_dp is None:
-            num_tokens_across_dp = getattr(forward_context, "num_tokens_across_dp", None)
+        input_ids = forward_context.input_ids
+        num_tokens_across_dp = getattr(forward_context, "num_tokens_across_dp", None)
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -492,9 +487,14 @@ class AscendFusedMoE(FusedMoE):
         )
 
     def forward_impl(  # type: ignore[override]
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor,
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
         return_with_event: bool = False,
-        overlap_events=None, microbatch_role: str | None = None,
+        overlap_events=None,
+        microbatch_role: str | None = None,
+        input_ids: torch.Tensor | None = None,
+        num_tokens_across_dp: torch.Tensor | None = None,
     ) -> torch.Tensor | FusedMoEResult:
         assert self.quant_method is not None
 
@@ -531,9 +531,7 @@ class AscendFusedMoE(FusedMoE):
                 ):
                     shared_out = tensor_model_parallel_all_reduce(shared_out)
                 set_flash_common3_context(shared_out=shared_out)
-                input_ids = getattr(forward_context, "moe_local_input_ids", None)
-                if input_ids is None:
-                    input_ids = forward_context.input_ids
+                input_ids = forward_context.input_ids
                 topk_weights, topk_ids = select_experts(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
@@ -547,8 +545,9 @@ class AscendFusedMoE(FusedMoE):
                     routed_scaling_factor=self.routed_scaling_factor,
                     e_score_correction_bias=self.e_score_correction_bias,
                     global_num_experts=self.global_num_experts,
-                    input_ids=input_ids,  # Note: get ids from forward context
-                    tid2eid=self.tid2eid,  # 
+                    input_ids=input_ids,
+                    tid2eid=self.tid2eid,
+                    num_tokens_across_dp=getattr(forward_context, "num_tokens_across_dp", None),
                 )
 
                 if isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl):
@@ -576,7 +575,6 @@ class AscendFusedMoE(FusedMoE):
         if self.multistream_overlap_gate:
             torch.npu.current_stream().wait_stream(AscendFusedMoE.gate_stream)
 
-        # Expose microbatch state to fused_experts() without changing apply() signatures.
         if overlap_events is not None:
             _EXTRA_CTX.moe_comm_method._overlap_events = overlap_events
             _EXTRA_CTX.moe_comm_method._microbatch_role = microbatch_role
@@ -609,6 +607,8 @@ class AscendFusedMoE(FusedMoE):
             log2phy=self.log2phy,
             global_redundant_expert_num=self.global_redundant_expert_num,
             mc2_mask=mc2_mask,
+            input_ids=input_ids,
+            num_tokens_across_dp=num_tokens_across_dp,
         )
 
         if self.dynamic_eplb:
@@ -880,6 +880,8 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             hidden_states=hidden_states,
             router_logits=router_logits,
             return_with_event=True,
+            input_ids=forward_context.input_ids,
+            num_tokens_across_dp=getattr(forward_context, "num_tokens_across_dp", None),
         )
         routed_out = fused_moe_results.routed_out
 
@@ -944,9 +946,6 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         router_logits_b1 = router_logits[mid:]
 
         forward_context = get_forward_context()
-        moe_comm_method = _EXTRA_CTX.moe_comm_method
-        original_microbatch_input_ids = getattr(moe_comm_method, "_microbatch_input_ids", None)
-        original_microbatch_num_tokens_across_dp = getattr(moe_comm_method, "_microbatch_num_tokens_across_dp", None)
         original_input_ids = forward_context.input_ids
         input_ids_b0 = original_input_ids[:mid] if original_input_ids is not None else None
         input_ids_b1 = original_input_ids[mid:] if original_input_ids is not None else None
@@ -969,8 +968,6 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         overlap_events = MicrobatchOverlapEvents()
 
         # Run the full batch0 pipeline on the main stream.
-        moe_comm_method._microbatch_input_ids = input_ids_b0
-        moe_comm_method._microbatch_num_tokens_across_dp = num_tokens_across_dp_b0
         fused_moe_results_b0 = AscendFusedMoE.forward_impl(
             self,
             hidden_states=hidden_states_b0,
@@ -978,12 +975,12 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             return_with_event=True,
             overlap_events=overlap_events,
             microbatch_role="batch0",
+            input_ids=input_ids_b0,
+            num_tokens_across_dp=num_tokens_across_dp_b0,
         )
         routed_out_b0 = fused_moe_results_b0.routed_out
 
         # Run the full batch1 pipeline on the microbatch stream.
-        moe_comm_method._microbatch_input_ids = input_ids_b1
-        moe_comm_method._microbatch_num_tokens_across_dp = num_tokens_across_dp_b1
         with npu_stream_switch(mb_stream):
             fused_moe_results_b1 = AscendFusedMoE.forward_impl(
                 self,
@@ -992,11 +989,11 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
                 return_with_event=True,
                 overlap_events=overlap_events,
                 microbatch_role="batch1",
+                input_ids=input_ids_b1,
+                num_tokens_across_dp=num_tokens_across_dp_b1,
             )
             routed_out_b1 = fused_moe_results_b1.routed_out
 
-        moe_comm_method._microbatch_input_ids = original_microbatch_input_ids
-        moe_comm_method._microbatch_num_tokens_across_dp = original_microbatch_num_tokens_across_dp
         evt_b1_all_done = mb_stream.record_event()
 
         # Defer ReduceScatter so RS-b0 does not block AG-b1, then run RS-b1

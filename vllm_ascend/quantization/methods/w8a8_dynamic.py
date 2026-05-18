@@ -188,6 +188,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         apply_router_weight_on_input: bool = False,
         mc2_mask: torch.Tensor | None = None,
         tid2eid: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
+        num_tokens_across_dp: torch.Tensor | None = None,
     ) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
@@ -203,11 +205,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             topk_ids = fc3_context.topk_ids
         else:
             forward_context = get_forward_context()
-            moe_comm_method = forward_context.moe_comm_method
-            input_ids = getattr(moe_comm_method, "_microbatch_input_ids", None)
             if input_ids is None:
                 input_ids = forward_context.input_ids
-            num_tokens_across_dp = getattr(moe_comm_method, "_microbatch_num_tokens_across_dp", None)
             if num_tokens_across_dp is None:
                 num_tokens_across_dp = getattr(forward_context, "num_tokens_across_dp", None)
             topk_weights, topk_ids = select_experts(

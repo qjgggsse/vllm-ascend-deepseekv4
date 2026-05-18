@@ -147,12 +147,16 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         global_redundant_expert_num: int = 0,
         pertoken_scale: torch.Tensor | None = None,
         mc2_mask: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
+        num_tokens_across_dp: torch.Tensor | None = None,
     ) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
         forward_context = get_forward_context()
-        input_ids = forward_context.input_ids
-        num_tokens_across_dp = getattr(forward_context, "num_tokens_across_dp", None)
+        if input_ids is None:
+            input_ids = forward_context.input_ids
+        if num_tokens_across_dp is None:
+            num_tokens_across_dp = getattr(forward_context, "num_tokens_across_dp", None)
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,

@@ -190,6 +190,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         tid2eid: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
         num_tokens_across_dp: torch.Tensor | None = None,
+        prepared_num_tokens: int | None = None,
     ) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
@@ -225,6 +226,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 tid2eid=tid2eid,
                 input_ids=input_ids,
                 num_tokens_across_dp=num_tokens_across_dp,
+                prepared_num_tokens=prepared_num_tokens,
             )
         assert topk_ids is not None
         assert topk_weights is not None

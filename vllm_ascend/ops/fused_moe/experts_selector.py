@@ -47,6 +47,7 @@ def select_experts(
     input_ids: Optional[torch.Tensor] = None,
     tid2eid: Optional[torch.Tensor] = None,
     num_tokens_across_dp: Optional[torch.Tensor] = None,
+    prepared_num_tokens: int | None = None,
 ):
     """
     Fused experts with select experts.
@@ -98,6 +99,7 @@ def select_experts(
             tid2eid=tid2eid,
             input_ids=input_ids,
             num_tokens_across_dp=num_tokens_across_dp,
+            prepared_num_tokens=prepared_num_tokens,
         )
     else:
         topk_weights, topk_ids = _native_select_experts(
@@ -230,6 +232,7 @@ def _select_experts_with_fusion_ops(
     tid2eid=None,
     input_ids=None,
     num_tokens_across_dp=None,
+    prepared_num_tokens: int | None = None,
     ):
     topk_group = topk_group if topk_group is not None else 1
     num_expert_group = num_expert_group if num_expert_group is not None else 1
@@ -245,11 +248,10 @@ def _select_experts_with_fusion_ops(
             if forward_context.moe_comm_type == MoECommType.ALLGATHER:
                 prepare_finalize = forward_context.moe_comm_method.prepare_finalize
                 input_ids_before_gather = input_ids.shape[0]
-                microbatch_role = getattr(forward_context.moe_comm_method, "_microbatch_role", None)
                 input_ids = prepare_finalize.all_gather_input_id_with_dp_group(
                     input_ids,
                     num_tokens_across_dp=num_tokens_across_dp,
-                    microbatch_role=microbatch_role,
+                    prepared_num_tokens=prepared_num_tokens,
                 )
                 if input_ids.numel() != router_logits.shape[0]:
                     local_tokens = getattr(prepare_finalize, "num_tokens", None)

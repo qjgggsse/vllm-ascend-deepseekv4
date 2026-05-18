@@ -176,6 +176,7 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
             mc2_mask=None,
             padded_hidden_states_shape=padded_hidden_states_shape,
             pertoken_scale=None,
+            prepared_num_tokens=hidden_states.shape[0],
         )
     
     def pad_and_split_input_ids(
@@ -420,6 +421,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             mc2_mask=None,
             padded_hidden_states_shape=None,
             pertoken_scale=pertoken_scale,
+            prepared_num_tokens=hidden_states.shape[0],
         )
 
     def _prepare_with_dp_group(
@@ -477,27 +479,23 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             mc2_mask=None,
             padded_hidden_states_shape=None,
             pertoken_scale=None,
+            prepared_num_tokens=hidden_states.shape[0],
         )
 
     def all_gather_input_id_with_dp_group(
         self,
         input_ids: torch.Tensor,
         num_tokens_across_dp: torch.Tensor | None = None,
-        microbatch_role: str | None = None,
+        prepared_num_tokens: int | None = None,
     ) -> torch.Tensor:
         target_num_tokens = None
-        if num_tokens_across_dp is not None:
+        if prepared_num_tokens is not None:
+            target_num_tokens = prepared_num_tokens
+        elif num_tokens_across_dp is not None:
             target_num_tokens = int(num_tokens_across_dp.max().item())
         elif self.moe_config.dp_size > 1:
             target_num_tokens = _EXTRA_CTX.max_tokens_across_dp
-        elif microbatch_role == "batch0" and getattr(self, "b0_num_tokens", None) is not None:
-            target_num_tokens = self.b0_num_tokens
-        elif microbatch_role == "batch1" and getattr(self, "b1_num_tokens", None) is not None:
-            target_num_tokens = self.b1_num_tokens
-        elif getattr(self, "num_tokens", None) is not None:
-            target_num_tokens = self.num_tokens
-
-        if target_num_tokens is None:
+        else:
             return input_ids
 
         pad_size = target_num_tokens - input_ids.shape[0]

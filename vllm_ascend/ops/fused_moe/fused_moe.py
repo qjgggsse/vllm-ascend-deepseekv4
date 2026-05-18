@@ -149,6 +149,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         mc2_mask: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
         num_tokens_across_dp: torch.Tensor | None = None,
+        prepared_num_tokens: int | None = None,
     ) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
@@ -172,7 +173,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             global_num_experts=global_num_experts,
             tid2eid=self.tid2eid,
             input_ids=input_ids,
-            num_tokens_across_dp=num_tokens_across_dp)
+            num_tokens_across_dp=num_tokens_across_dp,
+            prepared_num_tokens=prepared_num_tokens)
         
         if layer.vllm_config.model_config is not None and layer.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -575,6 +577,7 @@ class AscendFusedMoE(FusedMoE):
         mc2_mask = prepare_output.mc2_mask
         padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
         pertoken_scale = prepare_output.pertoken_scale
+        prepared_num_tokens = prepare_output.prepared_num_tokens
 
         # Make sure the default stream waits for the gate stream to finish.
         if self.multistream_overlap_gate:
@@ -614,6 +617,7 @@ class AscendFusedMoE(FusedMoE):
             mc2_mask=mc2_mask,
             input_ids=input_ids,
             num_tokens_across_dp=num_tokens_across_dp,
+            prepared_num_tokens=prepared_num_tokens,
         )
 
         if self.dynamic_eplb:

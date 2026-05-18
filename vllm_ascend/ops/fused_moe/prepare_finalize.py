@@ -474,9 +474,11 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         self, input_ids: torch.Tensor) -> torch.Tensor:
         if self.moe_config.dp_size > 1:
             forward_context = get_forward_context()
-            max_tokens_across_dp = getattr(
-                forward_context, "moe_local_max_tokens_across_dp", _EXTRA_CTX.max_tokens_across_dp
-            )
+            moe_local_num_tokens_across_dp = getattr(forward_context, "moe_local_num_tokens_across_dp", None)
+            if moe_local_num_tokens_across_dp is not None:
+                max_tokens_across_dp = int(moe_local_num_tokens_across_dp.max().item())
+            else:
+                max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
             pad_size = max_tokens_across_dp - self.num_tokens
             if pad_size > 0:
                 input_ids = nn.functional.pad(input_ids, (0, pad_size))
